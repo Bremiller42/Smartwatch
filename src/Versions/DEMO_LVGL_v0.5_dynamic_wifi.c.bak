@@ -1,0 +1,1732 @@
+// DEMO_LVGL.c (refactored full file)
+// - Fixes duplicate/stacking activity callbacks
+// - Fixes implicit declaration ordering issues
+// - Keeps touch polling timer (best reliability for Settings screen / scrollables)
+// - Attaches activity_event_cb ONCE per screen (when the screen is built)
+// - Removes re-attaching activity cb every ui_show()
+
+#include <lvgl.h>
+
+#include "display.h"
+#include "esp_bsp.h"
+#include "lv_port.h"
+#include "fonts/orbitron_72.h"
+
+#include "esp_wifi.h"
+#include "esp_wifi_types.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+
+#include "esp_sntp.h"
+
+#include <stdio.h>
+#include <time.h>
+#include <sys/time.h>
+
+#include <esp_log.h>
+#include <esp_flash.h>
+#include <esp_chip_info.h>
+#include <esp_system.h>
+#include <esp_heap_caps.h>
+#include <inttypes.h>   // PRIu32
+
+// ✅ NVS
+#include "nvs_flash.h"
+#include "nvs.h"
+
+/* ---------------- Globals ---------------- */
+
+static const char *TAG = "SmartWatch_UI";
+
+static lv_obj_t *clock_date_lbl = NULL;
+static lv_obj_t *clock_time_lbl = NULL;
+static lv_timer_t *clock_timer  = NULL;
+
+static bool use_24h_format = false;
+static bool g_time_synced = false;
+
+static int g_brightness = 70;
+static lv_obj_t *brightness_slider = NULL;
+
+// WIFI Icons
+static lv_obj_t *clock_wifi_icon = NULL;
+
+// IP Label
+static lv_obj_t *ip_lbl = NULL;
+
+/* Set-time Dialog state */
+static lv_obj_t *settime_modal = NULL;
+static lv_obj_t *settime_h_lbl = NULL;
+static lv_obj_t *settime_m_lbl = NULL;
+static int set_h = 12;
+static int set_m = 0;
+
+/* ---------------- Wi-Fi ---------------- */
+
+static EventGroupHandle_t s_wifi_evgrp;
+static esp_netif_t *s_sta_netif = NULL;
+
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+#define KEY_WIFI_SSID   "wifissid"   // string
+#define KEY_WIFI_PASS   "wifipass"   // string
+
+static char g_wifi_ssid[33] = "";    // 32 + null
+static char g_wifi_pass[65] = "";    // 64 + null
+
+static int s_retry_num = 0;
+static const int WIFI_MAX_RETRY = 10;
+static char g_ip_str[16] = "0.0.0.0"; // enough for IPv4
+
+static bool s_netif_inited = false;
+static bool s_event_loop_inited = false;
+
+static lv_obj_t *wifi_modal = NULL;
+static lv_obj_t *wifi_list = NULL;
+static lv_obj_t *wifi_status_lbl = NULL;
+static lv_obj_t *wifi_pass_modal = NULL;
+static lv_obj_t *wifi_pass_ta = NULL;
+static lv_obj_t *wifi_kb = NULL;
+
+// Optional: show status in UI later
+static bool g_wifi_on = true;
+static bool g_wifi_connected = false;
+
+/**
+ * Rotation degree:
+ *   0   = portrait
+ *   90  = landscape CW
+ *   180 = upside down
+ *   270 = landscape CCW
+ */
+#define LVGL_PORT_ROTATION_DEGREE (90)
+
+#define logSection(section) \
+  ESP_LOGI(TAG, "\n\n************* %s **************\n", section);
+
+/* ---------------- Sleep / Wake ---------------- */
+
+#define SCREEN_TIMEOUT_MS   (15 * 1000)   // 15s for testing; change to 30*1000, 60*1000, etc.
+#define WAKE_DEBOUNCE_MS  250   // 250–400ms
+
+static lv_timer_t *sleep_timer = NULL;
+static uint32_t g_last_activity_ms = 0;
+static bool g_screen_awake = true;
+static lv_timer_t *touch_activity_timer = NULL;
+
+static uint32_t g_ignore_until_ms = 0;
+static bool g_require_release_after_wake = false;
+
+static lv_obj_t *wake_blocker = NULL;
+static bool g_blocker_active = false;
+
+
+
+/* ---------------- NVS Settings ---------------- */
+
+static nvs_handle_t g_nvs = 0;
+static bool g_nvs_ok = false;
+
+#define NVS_NS          "watch"
+#define KEY_BRIGHTNESS  "bright"   // i32
+#define KEY_USE_24H     "use24h"   // u8
+#define KEY_WIFI_ON     "wifion"  // u8
+
+
+/* ---------------- UI State ---------------- */
+
+typedef enum {
+    UI_HOME = 0,
+    UI_CLOCK = 1,
+    UI_SETTINGS = 2,
+} ui_screen_t;
+
+static lv_obj_t *scr_home     = NULL;
+static lv_obj_t *scr_clock    = NULL;
+static lv_obj_t *scr_settings = NULL;
+
+/* ---------------- Forward Declarations ---------------- */
+
+// NVS
+static void settings_nvs_init(void);
+static void settings_load_from_nvs(void);
+static void settings_save_brightness(int bright);
+static void settings_save_24h(bool use24);
+static void settings_save_wifi(bool on);
+
+// UI helpers
+static void apply_backlight_percent(int pct);
+static void ui_update_ip_label(void);
+static void clock_update_label_now(void);
+static void clock_update_wifi_icon_now(void);
+
+// Activity / sleep
+static void screen_sleep(void);
+static void screen_wake(void);
+static void mark_user_activity(void);
+static void sleep_timer_cb(lv_timer_t *t);
+static void touch_activity_timer_cb(lv_timer_t *t);
+static void activity_event_cb(lv_event_t *e);
+void _lv_indev_read(lv_indev_t * indev, lv_indev_data_t * data);
+
+static void wake_blocker_event_cb(lv_event_t *e);
+static void wake_blocker_create(void);
+static void wake_blocker_remove(void);
+
+
+// WiFi / SNTP
+static void time_set_timezone(void);
+static void sntp_start(void);
+static esp_err_t wifi_start_sta(const char *ssid, const char *pass);
+static void wifi_stop(void);
+static int  wifi_get_rssi_dbm(int *out_rssi);
+
+static void open_wifi_picker_modal(lv_obj_t *parent);
+static void close_wifi_picker_modal(void);
+static void start_wifi_scan(void);
+static void wifi_scan_done_to_ui(void *args);
+static void wifi_add_ap_to_list(const char *ssid, int rssi, wifi_auth_mode_t auth);
+static void on_open_wifi_picker(lv_event_t *e);
+static void on_wifi_ap_clicked(lv_event_t *e);
+static void open_wifi_password_modal(lv_obj_t *parent, const char *ssid);
+static void close_wifi_password_modal(void);
+static void on_wifi_pass_cancel(lv_event_t *e);
+static void on_wifi_pass_connect(lv_event_t *e);
+static void on_wifi_picker_close(lv_event_t *e);
+static void on_wifi_picker_scan(lv_event_t *e);
+// WiFi creds NVS helpers
+static void settings_save_wifi_creds(const char *ssid, const char *pass);
+static void settings_load_wifi_creds(void);
+
+// WiFi bring-up helper
+static void wifi_ensure_started(void);
+
+
+static bool g_scan_in_progress = false;
+static char g_selected_ssid[33] = "";
+
+static bool s_wifi_inited = false;
+static bool s_handlers_registered = false;
+static esp_event_handler_instance_t s_wifi_any_id_inst;
+static esp_event_handler_instance_t s_got_ip_inst;
+
+
+// UI screens
+static void ui_show(ui_screen_t s);
+static lv_obj_t *build_home_screen(void);
+static lv_obj_t *build_clock_screen(void);
+static lv_obj_t *build_settings_screen(void);
+
+// UI events
+static void on_back_to_home(lv_event_t * e);
+static void on_open_clock(lv_event_t * e);
+static void on_open_settings(lv_event_t * e);
+static void on_settings_back(lv_event_t *e);
+static void on_brightness_changed(lv_event_t *e);
+static void on_time_format_changed(lv_event_t *e);
+static void on_wifi_toggle(lv_event_t *e);
+
+// set time modal
+static void open_settime_modal(lv_obj_t *parent);
+static void settime_close(void);
+static void settime_refresh_labels(void);
+static void on_open_settime(lv_event_t *e);
+static void on_settime_cancel(lv_event_t * e);
+static void on_settime_save(lv_event_t * e);
+static void on_inc_hour(lv_event_t *e);
+static void on_dec_hour(lv_event_t *e);
+static void on_inc_min(lv_event_t *e);
+static void on_dec_min(lv_event_t *e);
+
+// timers
+static void clock_timer_cb(lv_timer_t *t);
+
+// async ui
+static void ui_update_ip_label_async(void *arg);
+static void ui_update_clock_async(void *arg);
+static void ui_update_wifi_icon_async(void *arg);
+
+/* ---------------- NVS ---------------- */
+
+static void settings_nvs_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS needs erase (%s). Erasing...", esp_err_to_name(err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(err));
+        g_nvs_ok = false;
+        return;
+    }
+
+    err = nvs_open(NVS_NS, NVS_READWRITE, &g_nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        g_nvs_ok = false;
+        return;
+    }
+
+    g_nvs_ok = true;
+    ESP_LOGI(TAG, "NVS ready (ns=%s)", NVS_NS);
+}
+
+static void settings_load_from_nvs(void)
+{
+    if (!g_nvs_ok) return;
+
+    int32_t b = 0;
+    uint8_t u24 = 0;
+
+    esp_err_t err_b = nvs_get_i32(g_nvs, KEY_BRIGHTNESS, &b);
+    if (err_b == ESP_OK) {
+        g_brightness = (int)b;
+        if (g_brightness < 0) g_brightness = 0;
+        if (g_brightness > 100) g_brightness = 100;
+        ESP_LOGI(TAG, "Loaded brightness=%d", g_brightness);
+    } else {
+        ESP_LOGW(TAG, "Brightness not found (%s). Using default=%d",
+                 esp_err_to_name(err_b), g_brightness);
+    }
+
+    esp_err_t err_24 = nvs_get_u8(g_nvs, KEY_USE_24H, &u24);
+    if (err_24 == ESP_OK) {
+        use_24h_format = (u24 != 0);
+        ESP_LOGI(TAG, "Loaded use24h=%d", (int)use_24h_format);
+    } else {
+        ESP_LOGW(TAG, "use24h not found (%s). Using default=%d",
+                 esp_err_to_name(err_24), (int)use_24h_format);
+    }
+
+    uint8_t won = 0;
+    esp_err_t err_w = nvs_get_u8(g_nvs, KEY_WIFI_ON, &won);
+    if (err_w == ESP_OK) {
+        g_wifi_on = (won != 0);
+        ESP_LOGI(TAG, "Loaded wifi_on=%d", (int)g_wifi_on);
+    } else {
+        ESP_LOGW(TAG, "wifi_on not found (%s). Using default=%d",
+                 esp_err_to_name(err_w), (int)g_wifi_on);
+    }
+    
+    settings_load_wifi_creds();
+
+}
+
+static void settings_save_brightness(int bright)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(TAG, "Save brightness skipped (NVS not ready)");
+        return;
+    }
+
+    if (bright < 0) bright = 0;
+    if (bright > 100) bright = 100;
+
+    esp_err_t err = nvs_set_i32(g_nvs, KEY_BRIGHTNESS, (int32_t)bright);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Save brightness set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_commit(g_nvs);
+    ESP_LOGI(TAG, "Saved brightness=%d (%s)", bright, esp_err_to_name(err));
+}
+
+static void settings_save_24h(bool use24)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(TAG, "Save use24h skipped (NVS not ready)");
+        return;
+    }
+
+    esp_err_t err = nvs_set_u8(g_nvs, KEY_USE_24H, use24 ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Save use24h set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_commit(g_nvs);
+    ESP_LOGI(TAG, "Saved use24h=%d (%s)", (int)use24, esp_err_to_name(err));
+}
+
+static void settings_save_wifi(bool on)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(TAG, "Save wifi_on skipped (NVS not ready)");
+        return;
+    }
+
+    esp_err_t err = nvs_set_u8(g_nvs, KEY_WIFI_ON, on ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Save wifi_on set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_commit(g_nvs);
+    ESP_LOGI(TAG, "Saved wifi_on=%d (%s)", (int)on, esp_err_to_name(err));
+}
+
+/* ---------------- UI Helpers ---------------- */
+
+static void apply_backlight_percent(int pct)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    bsp_display_brightness_set(pct);
+}
+
+static void ui_update_ip_label(void)
+{
+    if (!ip_lbl) return;
+    lv_label_set_text(ip_lbl, g_ip_str);
+}
+
+/* ---------------- Async UI helpers ---------------- */
+
+static void ui_update_ip_label_async(void *arg)
+{
+    (void)arg;
+    bsp_display_lock(0);
+    ui_update_ip_label();
+    bsp_display_unlock();
+}
+
+static void ui_update_clock_async(void *arg)
+{
+    (void)arg;
+    bsp_display_lock(0);
+    clock_update_label_now();
+    bsp_display_unlock();
+}
+
+static void ui_update_wifi_icon_async(void *arg)
+{
+    (void)arg;
+    bsp_display_lock(0);
+    clock_update_wifi_icon_now();
+    bsp_display_unlock();
+}
+
+/* ---------------- Wifi - Helpers ---------------- */
+
+static void settings_save_wifi_creds(const char *ssid, const char *pass)
+{
+    if (!g_nvs_ok) return;
+    if (!ssid) ssid = "";
+    if (!pass) pass = "";
+
+    nvs_set_str(g_nvs, KEY_WIFI_SSID, ssid);
+    nvs_set_str(g_nvs, KEY_WIFI_PASS, pass);
+    nvs_commit(g_nvs);
+
+    snprintf(g_wifi_ssid, sizeof(g_wifi_ssid), "%s", ssid);
+    snprintf(g_wifi_pass, sizeof(g_wifi_pass), "%s", pass);
+}
+
+static void settings_load_wifi_creds(void)
+{
+    if (!g_nvs_ok) return;
+
+    size_t ssid_len = sizeof(g_wifi_ssid);
+    size_t pass_len = sizeof(g_wifi_pass);
+
+    esp_err_t e1 = nvs_get_str(g_nvs, KEY_WIFI_SSID, g_wifi_ssid, &ssid_len);
+    esp_err_t e2 = nvs_get_str(g_nvs, KEY_WIFI_PASS, g_wifi_pass, &pass_len);
+
+    if (e1 != ESP_OK) g_wifi_ssid[0] = '\0';
+    if (e2 != ESP_OK) g_wifi_pass[0] = '\0';
+}
+
+
+/* ---------------- Time/SNTP ---------------- */
+
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    (void)tv;
+    g_time_synced = true;
+    ESP_LOGI(TAG, "SNTP time synced");
+
+    lv_async_call(ui_update_clock_async, NULL);
+}
+
+static void time_set_timezone(void)
+{
+    setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2", 1);
+    tzset();
+}
+
+static void sntp_start(void)
+{
+    if (esp_sntp_enabled()) {
+        ESP_LOGI(TAG, "SNTP already running");
+        return;
+    }
+
+    time_set_timezone();
+
+    ESP_LOGI(TAG, "Starting SNTP...");
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.nist.gov");
+
+    esp_sntp_set_sync_interval(60 * 60 * 1000);  // every 1 hour
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_init();
+}
+
+/* ---------------- Sleep / Wake ---------------- */
+
+static void screen_sleep(void)
+{
+    if (!g_screen_awake) return;
+    g_screen_awake = false;
+
+    ESP_LOGI(TAG, "Screen -> SLEEP");
+    g_blocker_active = true;
+    wake_blocker_create();
+    ESP_LOGI(TAG, "Screen -> LOCKED");
+
+    bsp_display_backlight_off();
+
+    if (clock_timer) lv_timer_pause(clock_timer);
+}
+
+static void screen_wake(void)
+{
+    if (g_screen_awake) return;
+    g_screen_awake = true;
+
+    ESP_LOGI(TAG, "Screen -> WAKE");
+
+    apply_backlight_percent(g_brightness);
+
+    /* ✅ Prevent immediate re-sleep */
+    g_last_activity_ms = lv_tick_get();
+
+    /* Keep blocker active for WAKE_DEBOUNCE_MS after wake */
+    g_ignore_until_ms = lv_tick_get() + WAKE_DEBOUNCE_MS;
+    g_blocker_active = true;
+
+    /* Optional but recommended: require release so you never remove while finger is down */
+    g_require_release_after_wake = true;
+
+    /* Ensure blocker exists */
+    wake_blocker_create();
+
+    if (clock_timer) lv_timer_resume(clock_timer);
+}
+
+
+static void wake_blocker_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+
+    /* If we're asleep, any press wakes the screen, but we swallow the event */
+    if (!g_screen_awake) {
+        if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING || code == LV_EVENT_CLICKED) {
+            mark_user_activity();  // updates last_activity + wakes
+        }
+        lv_event_stop_bubbling(e);
+        lv_event_stop_processing(e);
+        return;
+    }
+
+    /* If we're awake but blocker is still active (debounce window), swallow everything */
+    if (g_blocker_active) {
+        lv_event_stop_bubbling(e);
+        lv_event_stop_processing(e);
+    }
+}
+
+static void wake_blocker_create(void)
+{
+    if (wake_blocker) return;
+
+    wake_blocker = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(wake_blocker, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_opa(wake_blocker, LV_OPA_0, 0);
+    lv_obj_set_style_border_opa(wake_blocker, LV_OPA_0, 0);
+    lv_obj_clear_flag(wake_blocker, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Must be clickable to receive pointer events */
+    lv_obj_add_flag(wake_blocker, LV_OBJ_FLAG_CLICKABLE);
+
+    /* Eat all events */
+    lv_obj_add_event_cb(wake_blocker, wake_blocker_event_cb, LV_EVENT_ALL, NULL);
+}
+
+static void wake_blocker_remove(void)
+{
+    if (wake_blocker) {
+        lv_obj_del(wake_blocker);
+        wake_blocker = NULL;
+        ESP_LOGI(TAG, "Screen -> UNLOCKED");
+
+    }
+}
+
+
+static void mark_user_activity(void)
+{
+    g_last_activity_ms = lv_tick_get();
+
+    if (!g_screen_awake) {
+        screen_wake();
+    }
+}
+
+static void sleep_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!g_screen_awake) return;
+
+    uint32_t now = lv_tick_get();
+    if ((now - g_last_activity_ms) >= SCREEN_TIMEOUT_MS) {
+        screen_sleep();
+    }
+}
+
+/* Touch polling timer: */
+static void touch_activity_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+
+    lv_indev_t *indev = bsp_display_get_input_dev();
+    if (!indev) return;
+
+    lv_indev_data_t data;
+    _lv_indev_read(indev, &data);
+
+    uint32_t now = lv_tick_get();
+
+    // If screen is asleep and we detect a press: wake and swallow
+    if (!g_screen_awake) {
+        if (data.state == LV_INDEV_STATE_PRESSED) {
+            mark_user_activity();           // ✅ updates last_activity + wakes
+        }
+        return;
+    }
+
+    // If we're in the debounce time window after wake, swallow everything
+    if ((int32_t)(now - g_ignore_until_ms) < 0) {
+        g_blocker_active = true;
+        return;
+    }
+
+    // Require a full release after wake before accepting any presses
+    if (g_require_release_after_wake) {
+        g_blocker_active = true;
+        if (data.state == LV_INDEV_STATE_RELEASED) {
+            g_require_release_after_wake = false;
+        }
+        return;
+    }
+    g_blocker_active = false;
+    wake_blocker_remove();
+
+
+    // Normal activity tracking
+    if (data.state == LV_INDEV_STATE_PRESSED) {
+        mark_user_activity();
+    }
+}
+
+
+static void activity_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+
+    if (code == LV_EVENT_PRESSED ||
+        code == LV_EVENT_PRESSING ||
+        code == LV_EVENT_CLICKED ||
+        code == LV_EVENT_GESTURE)
+    {
+        mark_user_activity();
+    }
+}
+
+static void start_wifi_scan(void)
+{
+    if (!g_wifi_on) return;
+
+    wifi_ensure_started();
+
+    wifi_scan_config_t scan_cfg = {
+        .ssid = 0,
+        .bssid = 0,
+        .channel = 0,
+        .show_hidden = true
+    };
+
+    g_scan_in_progress = true;
+
+    if (wifi_status_lbl) lv_label_set_text(wifi_status_lbl, "Scanning...");
+    ESP_LOGI(TAG, "Starting WiFi scan...");
+    ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_cfg, false));
+}
+
+
+static const char* auth_to_str(wifi_auth_mode_t a)
+{
+    switch (a) {
+        case WIFI_AUTH_OPEN: return "Open";
+        case WIFI_AUTH_WEP: return "WEP";
+        case WIFI_AUTH_WPA_PSK: return "WPA";
+        case WIFI_AUTH_WPA2_PSK: return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+        case WIFI_AUTH_WPA3_PSK: return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+        default: return "Sec";
+    }
+}
+
+static void wifi_add_ap_to_list(const char *ssid, int rssi, wifi_auth_mode_t auth)
+{
+    if (!wifi_list || !ssid || !ssid[0]) return;
+
+    lv_obj_t *btn = lv_btn_create(wifi_list);
+    lv_obj_set_width(btn, lv_pct(100));
+    lv_obj_add_event_cb(btn, on_wifi_ap_clicked, LV_EVENT_CLICKED, NULL);
+
+    // Store SSID in user_data-ish way: put it in the button's child label text, or better:
+    lv_obj_set_user_data(btn, (void*)NULL); // if your LVGL build supports user_data you can store a ptr to a strdup.
+    // We'll just keep SSID in the label and read it back.
+
+    lv_obj_t *lbl = lv_label_create(btn);
+
+    char line[96];
+    snprintf(line, sizeof(line), "%s  (%ddBm, %s)", ssid, rssi, auth_to_str(auth));
+    lv_label_set_text(lbl, line);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(lbl, lv_pct(100));
+}
+
+static void wifi_scan_done_to_ui(void *arg)
+{
+    (void)arg;
+
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+
+    if (wifi_list) {
+        lv_obj_clean(wifi_list);
+    }
+
+    if (wifi_status_lbl) {
+        char st[64];
+        snprintf(st, sizeof(st), "Found %u networks", (unsigned)ap_count);
+        lv_label_set_text(wifi_status_lbl, st);
+    }
+
+    if (ap_count == 0) return;
+
+    // Pull records
+    wifi_ap_record_t *aprs = (wifi_ap_record_t*)calloc(ap_count, sizeof(wifi_ap_record_t));
+    if (!aprs) return;
+
+    uint16_t n = ap_count;
+    if (esp_wifi_scan_get_ap_records(&n, aprs) == ESP_OK) {
+        // Basic: just list them. (Optional: sort by RSSI, de-dupe SSIDs)
+        for (int i = 0; i < n; i++) {
+            wifi_add_ap_to_list((const char*)aprs[i].ssid, aprs[i].rssi, aprs[i].authmode);
+        }
+    }
+
+    free(aprs);
+}
+
+
+/* ---------------- Wi-Fi ---------------- */
+
+static void wifi_event_handler(void *arg,
+                               esp_event_base_t event_base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    (void)arg;
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi STA start -> connect");
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        g_wifi_connected = false;
+        lv_async_call(ui_update_wifi_icon_async, NULL);
+
+        if (s_retry_num < WIFI_MAX_RETRY) {
+            s_retry_num++;
+            ESP_LOGW(TAG, "WiFi disconnected, retry %d/%d", s_retry_num, WIFI_MAX_RETRY);
+            esp_wifi_connect();
+        } else {
+            ESP_LOGE(TAG, "WiFi failed to connect");
+            xEventGroupSetBits(s_wifi_evgrp, WIFI_FAIL_BIT);
+        }
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        s_retry_num = 0;
+        g_wifi_connected = true;
+        lv_async_call(ui_update_wifi_icon_async, NULL);
+
+        ESP_LOGI(TAG, "Connected to %s", g_wifi_ssid);
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        if (s_wifi_evgrp) xEventGroupSetBits(s_wifi_evgrp, WIFI_CONNECTED_BIT);
+
+        snprintf(g_ip_str, sizeof(g_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
+        lv_async_call(ui_update_ip_label_async, NULL);
+
+        sntp_start();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE){
+        g_scan_in_progress = false;
+        lv_async_call(wifi_scan_done_to_ui, NULL);
+    }
+}
+
+static esp_err_t wifi_start_sta(const char *ssid, const char *pass)
+{
+    if (!ssid || ssid[0] == '\0') return ESP_ERR_INVALID_ARG;
+    if (!s_wifi_evgrp) s_wifi_evgrp = xEventGroupCreate();
+
+    wifi_ensure_started();
+
+    // New attempt
+    xEventGroupClearBits(s_wifi_evgrp, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    s_retry_num = 0;
+
+    // Break any existing connection cleanly
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    wifi_config_t wifi_config = { 0 };
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", ssid);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", pass ? pass : "");
+
+    wifi_config.sta.pmf_cfg.capable = true;
+    wifi_config.sta.pmf_cfg.required = false;
+
+    // If you want to allow open networks, don't force WPA2 here
+    // wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_connect());
+
+    ESP_LOGI(TAG, "wifi_start_sta() connect requested (ssid=%s)", ssid);
+    return ESP_OK;
+}
+
+static void wifi_stop(void)
+{
+    g_wifi_connected = false;
+    s_retry_num = 0;
+
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    ESP_LOGI(TAG, "WiFi stopped");
+
+    if (esp_sntp_enabled()) {
+        esp_sntp_stop();
+        ESP_LOGI(TAG, "SNTP stopped");
+    }
+
+    g_time_synced = false;
+}
+
+static void wifi_ensure_started(void)
+{
+    if (!s_wifi_evgrp) {
+        s_wifi_evgrp = xEventGroupCreate();
+        assert(s_wifi_evgrp);
+    }
+    if (!s_netif_inited) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        s_netif_inited = true;
+    }
+
+    if (!s_event_loop_inited) {
+        esp_err_t e = esp_event_loop_create_default();
+        if (e == ESP_OK || e == ESP_ERR_INVALID_STATE) {
+            s_event_loop_inited = true;
+        } else {
+            ESP_ERROR_CHECK(e);
+        }
+    }
+
+    if (!s_sta_netif) {
+        s_sta_netif = esp_netif_create_default_wifi_sta();
+    }
+
+    if (!s_wifi_inited) {
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        s_wifi_inited = true;
+    }
+
+    if (!s_handlers_registered) {
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(
+            WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &s_wifi_any_id_inst));
+
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(
+            IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &s_got_ip_inst));
+
+        s_handlers_registered = true;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    // Start once; if already started, INVALID_STATE is fine to ignore
+    esp_err_t st = esp_wifi_start();
+    if (st != ESP_OK && st != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(st);
+    }
+}
+
+
+static int wifi_get_rssi_dbm(int *out_rssi)
+{
+    if (!g_wifi_connected) return -1;
+
+    wifi_ap_record_t ap = {0};
+    esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+    if (err != ESP_OK) return -1;
+
+    if (out_rssi) *out_rssi = ap.rssi;
+    return 0;
+}
+static void on_open_wifi_picker(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_wifi_picker_modal(lv_scr_act());
+}
+
+static void open_wifi_picker_modal(lv_obj_t *parent)
+{
+    if (wifi_modal) return;
+
+    wifi_modal = lv_obj_create(parent);
+    lv_obj_set_size(wifi_modal, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(wifi_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(wifi_modal, LV_OPA_70, 0);
+    lv_obj_clear_flag(wifi_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(wifi_modal);
+    lv_obj_set_size(card,  lv_pct(90), lv_pct(80));
+    lv_obj_center(card);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Wifi Networks");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
+
+    wifi_list = lv_obj_create(card);
+    lv_obj_set_size(wifi_list, lv_pct(90), 250);
+    lv_obj_align(wifi_list, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_obj_set_flex_flow(wifi_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(wifi_list, 6, 0);
+    lv_obj_add_flag(wifi_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *btn_close = lv_btn_create(card);
+    lv_obj_set_size(btn_close, 90, 32);
+    lv_obj_align(btn_close, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_add_event_cb(btn_close, on_wifi_picker_close, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(btn_close), "Close");
+    lv_obj_center(lv_obj_get_child(btn_close, 0));
+
+    lv_obj_t *btn_scan = lv_btn_create(card);
+    lv_obj_set_size(btn_scan, 90, 32);
+    lv_obj_align(btn_scan, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_add_event_cb(btn_scan, on_wifi_picker_scan, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(btn_scan), "Scan");
+    lv_obj_center(lv_obj_get_child(btn_scan, 0));
+
+    // Auto-scan when opened
+    start_wifi_scan();
+}
+
+static void close_wifi_picker_modal(void)
+{
+    if (wifi_modal) {
+        lv_obj_del(wifi_modal);
+        wifi_modal = NULL;
+        wifi_list = NULL;
+        wifi_status_lbl = NULL;
+    }
+}
+static void on_wifi_ap_clicked(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    const char *line = lv_label_get_text(lbl);
+    if (!line) return;
+
+    // Parse SSID from "SSID  (..."
+    char ssid[33] = {0};
+    int i = 0;
+    while (line[i] && i < 32) {
+        if (line[i] == ' ' && line[i+1] == ' ') break;
+        ssid[i] = line[i];
+        i++;
+    }
+    ssid[i] = '\0';
+
+    snprintf(g_selected_ssid, sizeof(g_selected_ssid), "%s", ssid);
+
+    // Open password modal
+    open_wifi_password_modal(lv_scr_act(), g_selected_ssid);
+}
+
+static void open_wifi_password_modal(lv_obj_t *parent, const char *ssid)
+{
+    if (wifi_pass_modal) return;
+
+    wifi_pass_modal = lv_obj_create(parent);
+    lv_obj_set_size(wifi_pass_modal, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(wifi_pass_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(wifi_pass_modal, LV_OPA_70, 0);
+    lv_obj_clear_flag(wifi_pass_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(wifi_pass_modal);
+    lv_obj_set_size(card, 300, 360);
+    lv_obj_center(card);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *t = lv_label_create(card);
+    char title[64];
+    snprintf(title, sizeof(title), "Join: %s", ssid ? ssid : "");
+    lv_label_set_text(t, title);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+
+    wifi_pass_ta = lv_textarea_create(card);
+    lv_obj_set_width(wifi_pass_ta, 260);
+    lv_obj_align(wifi_pass_ta, LV_ALIGN_TOP_MID, 0, 40);
+    lv_textarea_set_password_mode(wifi_pass_ta, true);
+    lv_textarea_set_one_line(wifi_pass_ta, true);
+    lv_textarea_set_placeholder_text(wifi_pass_ta, "Password");
+
+    wifi_kb = lv_keyboard_create(card);
+    lv_obj_set_size(wifi_kb, 280, 180);
+    lv_obj_align(wifi_kb, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_keyboard_set_textarea(wifi_kb, wifi_pass_ta);
+
+    lv_obj_t *cancel = lv_btn_create(card);
+    lv_obj_set_size(cancel, 90, 32);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_add_event_cb(cancel, on_wifi_pass_cancel, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(cancel), "Cancel");
+    lv_obj_center(lv_obj_get_child(cancel, 0));
+
+    lv_obj_t *conn = lv_btn_create(card);
+    lv_obj_set_size(conn, 90, 32);
+    lv_obj_align(conn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_add_event_cb(conn, on_wifi_pass_connect, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(conn), "Connect");
+    lv_obj_center(lv_obj_get_child(conn, 0));
+}
+
+static void close_wifi_password_modal(void)
+{
+    if (wifi_pass_modal) {
+        lv_obj_del(wifi_pass_modal);
+        wifi_pass_modal = NULL;
+        wifi_pass_ta = NULL;
+        wifi_kb = NULL;
+    }
+}
+
+static void on_wifi_pass_cancel(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) close_wifi_password_modal();
+}
+
+static void on_wifi_pass_connect(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    const char *pass = lv_textarea_get_text(wifi_pass_ta);
+    if (!pass) pass = "";
+
+    // Save to NVS
+    settings_save_wifi_creds(g_selected_ssid, pass);
+
+    // Connect now
+    ESP_LOGI(TAG, "Connecting to selected SSID...");
+    wifi_start_sta(g_wifi_ssid, g_wifi_pass);
+
+    close_wifi_password_modal();
+
+    // Optional: close picker too
+    // close_wifi_picker_modal();
+}
+
+
+
+
+/* ---------------- UI Callbacks ---------------- */
+
+static void on_back_to_home(lv_event_t * e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) ui_show(UI_HOME);
+}
+
+static void on_open_clock(lv_event_t * e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) ui_show(UI_CLOCK);
+}
+
+static void on_open_settings(lv_event_t * e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) ui_show(UI_SETTINGS);
+}
+
+static void on_settings_back(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) ui_show(UI_HOME);
+}
+
+static void on_brightness_changed(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+
+    lv_obj_t *slider = lv_event_get_target(e);
+    g_brightness = lv_slider_get_value(slider);
+
+    apply_backlight_percent(g_brightness);
+
+    ESP_LOGI(TAG, "Brightness=%d -> saving", g_brightness);
+    settings_save_brightness(g_brightness);
+
+    // moving slider counts as activity, too
+    mark_user_activity();
+}
+
+static void on_time_format_changed(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+
+    lv_obj_t *sw = lv_event_get_target(e);
+    use_24h_format = lv_obj_has_state(sw, LV_STATE_CHECKED);
+
+    ESP_LOGI(TAG, "use24h toggled -> %d", (int)use_24h_format);
+    settings_save_24h(use_24h_format);
+
+    // toggle counts as activity
+    mark_user_activity();
+}
+
+static void on_wifi_toggle(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+
+    g_wifi_on = on;
+    settings_save_wifi(on);
+
+if (on) {
+    if (g_wifi_ssid[0]) {
+        ESP_LOGI(TAG, "WiFi toggle ON -> connecting to saved SSID");
+        wifi_start_sta(g_wifi_ssid, g_wifi_pass);
+    } else {
+        ESP_LOGI(TAG, "WiFi toggle ON -> no saved SSID, open picker");
+        open_wifi_picker_modal(lv_scr_act());
+    }
+} else {
+    ESP_LOGI(TAG, "WiFi toggle OFF");
+    wifi_stop();
+}
+
+
+
+    // toggle counts as activity
+    mark_user_activity();
+}
+
+static void on_wifi_picker_close(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) close_wifi_picker_modal();
+}
+
+static void on_wifi_picker_scan(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) start_wifi_scan();
+}
+
+
+/* ---------------- Clock ---------------- */
+
+static void clock_update_label_now(void)
+{
+    if (!clock_time_lbl) return;
+
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+
+    static char buf[24];
+
+    if (use_24h_format) {
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
+                 tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+    } else {
+        int hour12 = tm_now.tm_hour % 12;
+        if (hour12 == 0) hour12 = 12;
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d %s",
+                 hour12, tm_now.tm_min, tm_now.tm_sec,
+                 (tm_now.tm_hour >= 12) ? "PM" : "AM");
+    }
+
+    lv_label_set_text(clock_time_lbl, buf);
+
+    if (clock_date_lbl) {
+        static char dbuf[40];
+        strftime(dbuf, sizeof(dbuf), "%A, %B %d", &tm_now);
+        lv_label_set_text(clock_date_lbl, dbuf);
+    }
+}
+
+static void clock_update_wifi_icon_now(void)
+{
+    if (!clock_wifi_icon) return;
+
+    if (!g_wifi_connected) {
+        lv_label_set_text(clock_wifi_icon, LV_SYMBOL_WIFI);
+        lv_obj_set_style_text_opa(clock_wifi_icon, LV_OPA_50, 0);
+        return;
+    }
+
+    int rssi = -100;
+    if (wifi_get_rssi_dbm(&rssi) != 0) {
+        lv_label_set_text(clock_wifi_icon, LV_SYMBOL_WIFI);
+        lv_obj_set_style_text_opa(clock_wifi_icon, LV_OPA_COVER, 0);
+        return;
+    }
+
+    lv_label_set_text(clock_wifi_icon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_opa(clock_wifi_icon, LV_OPA_COVER, 0);
+}
+
+static void clock_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+
+    if (!g_screen_awake) return; // don't churn updates while asleep
+
+    clock_update_label_now();
+
+    static int tick = 0;
+    tick++;
+    if ((tick % 5) == 0) {
+        clock_update_wifi_icon_now();
+    }
+}
+
+/* ---------------- Set Time Modal ---------------- */
+
+static void set_system_time_hm(int hour, int minute)
+{
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+
+    tm_now.tm_hour = hour;
+    tm_now.tm_min  = minute;
+    tm_now.tm_sec  = 0;
+
+    time_t new_time = mktime(&tm_now);
+
+    struct timeval tv = { .tv_sec = new_time, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+}
+
+static void settime_refresh_labels(void)
+{
+    if (!settime_h_lbl || !settime_m_lbl) return;
+
+    static char buf[8];
+
+    snprintf(buf, sizeof(buf), "%02d", set_h);
+    lv_label_set_text(settime_h_lbl, buf);
+
+    snprintf(buf, sizeof(buf), "%02d", set_m);
+    lv_label_set_text(settime_m_lbl, buf);
+}
+
+static void settime_close(void)
+{
+    if (settime_modal) {
+        lv_obj_del(settime_modal);
+        settime_modal = NULL;
+        settime_h_lbl = NULL;
+        settime_m_lbl = NULL;
+    }
+}
+
+static void on_settime_cancel(lv_event_t * e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) settime_close();
+}
+
+static void on_settime_save(lv_event_t * e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        set_system_time_hm(set_h, set_m);
+        clock_update_label_now();
+        settime_close();
+    }
+}
+
+static void on_inc_hour(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        set_h = (set_h + 1) % 24;
+        settime_refresh_labels();
+    }
+}
+
+static void on_dec_hour(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        set_h = (set_h + 23) % 24;
+        settime_refresh_labels();
+    }
+}
+
+static void on_inc_min(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        set_m = (set_m + 1) % 60;
+        settime_refresh_labels();
+    }
+}
+
+static void on_dec_min(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        set_m = (set_m + 59) % 60;
+        settime_refresh_labels();
+    }
+}
+
+static void open_settime_modal(lv_obj_t *parent)
+{
+    if (settime_modal) return;
+
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    set_h = tm_now.tm_hour;
+    set_m = tm_now.tm_min;
+
+    settime_modal = lv_obj_create(parent);
+    lv_obj_set_size(settime_modal, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(settime_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(settime_modal, LV_OPA_60, 0);
+    lv_obj_clear_flag(settime_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(settime_modal);
+    lv_obj_set_size(card, 280, 220);
+    lv_obj_center(card);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Set Time");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, -10);
+
+    lv_obj_t *h_plus = lv_btn_create(card);
+    lv_obj_set_size(h_plus, 40, 40);
+    lv_obj_align(h_plus, LV_ALIGN_LEFT_MID, 50, -40);
+    lv_obj_add_event_cb(h_plus, on_inc_hour, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(h_plus), "+");
+    lv_obj_center(lv_obj_get_child(h_plus, 0));
+
+    lv_obj_t *h_minus = lv_btn_create(card);
+    lv_obj_set_size(h_minus, 40, 40);
+    lv_obj_align(h_minus, LV_ALIGN_LEFT_MID, 50, 40);
+    lv_obj_add_event_cb(h_minus, on_dec_hour, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(h_minus), "-");
+    lv_obj_center(lv_obj_get_child(h_minus, 0));
+
+    settime_h_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(settime_h_lbl, &lv_font_montserrat_32, 0);
+    lv_obj_align(settime_h_lbl, LV_ALIGN_LEFT_MID, 50, 0);
+
+    lv_obj_t *colon = lv_label_create(card);
+    lv_label_set_text(colon, ":");
+    lv_obj_set_style_text_font(colon, &lv_font_montserrat_32, 0);
+    lv_obj_align(colon, LV_ALIGN_CENTER, -5, 0);
+
+    lv_obj_t *m_plus = lv_btn_create(card);
+    lv_obj_set_size(m_plus, 40, 40);
+    lv_obj_align(m_plus, LV_ALIGN_RIGHT_MID, -50, -40);
+    lv_obj_add_event_cb(m_plus, on_inc_min, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(m_plus), "+");
+    lv_obj_center(lv_obj_get_child(m_plus, 0));
+
+    lv_obj_t *m_minus = lv_btn_create(card);
+    lv_obj_set_size(m_minus, 40, 40);
+    lv_obj_align(m_minus, LV_ALIGN_RIGHT_MID, -50, 40);
+    lv_obj_add_event_cb(m_minus, on_dec_min, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(m_minus), "-");
+    lv_obj_center(lv_obj_get_child(m_minus, 0));
+
+    settime_m_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(settime_m_lbl, &lv_font_montserrat_32, 0);
+    lv_obj_align(settime_m_lbl, LV_ALIGN_RIGHT_MID, -50, 0);
+
+    lv_obj_t *cancel = lv_btn_create(card);
+    lv_obj_set_size(cancel, 85, 30);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, -10, 10);
+    lv_obj_add_event_cb(cancel, on_settime_cancel, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(cancel), "Cancel");
+    lv_obj_center(lv_obj_get_child(cancel, 0));
+
+    lv_obj_t *save = lv_btn_create(card);
+    lv_obj_set_size(save, 85, 30);
+    lv_obj_align(save, LV_ALIGN_BOTTOM_RIGHT, 10, 10);
+    lv_obj_add_event_cb(save, on_settime_save, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(save), "Save");
+    lv_obj_center(lv_obj_get_child(save, 0));
+
+    settime_refresh_labels();
+}
+
+static void on_open_settime(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        open_settime_modal(lv_scr_act());
+    }
+}
+
+/* ---------------- Screens ---------------- */
+
+static lv_obj_t *build_home_screen(void)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    // Attach activity callback ONCE
+    lv_obj_add_event_cb(scr, activity_event_cb, LV_EVENT_ALL, NULL);
+
+    lv_obj_t *btn_clock = lv_btn_create(scr);
+    lv_obj_set_size(btn_clock, 180, 120);
+    lv_obj_align(btn_clock, LV_ALIGN_CENTER, 0, -70);
+    lv_obj_add_event_cb(btn_clock, on_open_clock, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(btn_clock), "Clock");
+    lv_obj_center(lv_obj_get_child(btn_clock, 0));
+
+    lv_obj_t *btn_settings = lv_btn_create(scr);
+    lv_obj_set_size(btn_settings, 180, 120);
+    lv_obj_align(btn_settings, LV_ALIGN_CENTER, 0, 70);
+    lv_obj_add_event_cb(btn_settings, on_open_settings, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(btn_settings), "Settings");
+    lv_obj_center(lv_obj_get_child(btn_settings, 0));
+
+    return scr;
+}
+
+static lv_obj_t *build_clock_screen(void)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    // Attach activity callback ONCE
+    lv_obj_add_event_cb(scr, activity_event_cb, LV_EVENT_ALL, NULL);
+
+    // Time
+    clock_time_lbl = lv_label_create(scr);
+    lv_obj_set_style_text_font(clock_time_lbl, &orbitron_72, 0);
+    lv_obj_set_style_text_color(clock_time_lbl, lv_color_white(), 0);
+    lv_obj_align(clock_time_lbl, LV_ALIGN_TOP_MID, 0, 30);
+
+    clock_update_label_now();
+
+    // Date
+    clock_date_lbl = lv_label_create(scr);
+    lv_obj_set_style_text_font(clock_date_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(clock_date_lbl, lv_color_white(), 0);
+    lv_obj_align(clock_date_lbl, LV_ALIGN_TOP_LEFT, 5, 5);
+    clock_update_label_now();
+
+    // WiFi icon (top-right)
+    clock_wifi_icon = lv_label_create(scr);
+    lv_obj_set_style_text_color(clock_wifi_icon, lv_color_white(), 0);
+    lv_obj_align(clock_wifi_icon, LV_ALIGN_TOP_RIGHT, -12, 12);
+    lv_label_set_text(clock_wifi_icon, LV_SYMBOL_WIFI);
+
+    clock_update_wifi_icon_now();
+
+    if (clock_timer == NULL) {
+        clock_timer = lv_timer_create(clock_timer_cb, 1000, NULL);
+    }
+
+    lv_obj_t *menu = lv_btn_create(scr);
+    lv_obj_set_size(menu, 90, 50);
+    lv_obj_set_style_bg_color(menu, lv_color_black(), 0);
+    lv_obj_align(menu, LV_ALIGN_BOTTOM_LEFT, 12, -12);
+    lv_obj_add_event_cb(menu, on_back_to_home, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(menu), LV_SYMBOL_HOME); 
+    lv_obj_center(lv_obj_get_child(menu, 0));
+
+    return scr;
+}
+
+static lv_obj_t *build_settings_screen(void)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    // Attach activity callback ONCE
+    lv_obj_add_event_cb(scr, activity_event_cb, LV_EVENT_ALL, NULL);
+
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "Settings");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
+
+    lv_obj_t *back = lv_btn_create(scr);
+    lv_obj_set_size(back, 90, 50);
+    lv_obj_set_style_bg_color(back, lv_color_black(), 0);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_LEFT, 12, -12);
+    lv_obj_add_event_cb(back, on_settings_back, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(back), LV_SYMBOL_LEFT " Back");
+    lv_obj_center(lv_obj_get_child(back, 0));
+
+    lv_obj_t *box = lv_obj_create(scr);
+    lv_obj_set_size(box, 300, 320);
+    lv_obj_align(box, LV_ALIGN_CENTER, 0, 10);
+
+    lv_obj_set_style_bg_opa(box, LV_OPA_20, 0);
+    lv_obj_set_style_pad_all(box, 12, 0);
+    lv_obj_set_style_pad_row(box, 12, 0);
+
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_add_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Row 1: WiFi
+    lv_obj_t *wifi_row = lv_obj_create(box);
+    lv_obj_set_size(wifi_row, lv_pct(100), 70);
+    lv_obj_set_style_bg_opa(wifi_row, LV_OPA_0, 0);
+    lv_obj_clear_flag(wifi_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *wifi_lbl = lv_label_create(wifi_row);
+    lv_label_set_text(wifi_lbl, "WiFi ");
+    lv_obj_align(wifi_lbl, LV_ALIGN_LEFT_MID, 10, -10);
+    lv_obj_set_style_text_color(wifi_lbl, lv_color_white(), 0);
+
+    // Row: WiFi Networks picker
+    lv_obj_t *pick_row = lv_btn_create(box);
+    lv_obj_set_size(pick_row, lv_pct(100), 70);
+    lv_obj_add_event_cb(pick_row, on_open_wifi_picker, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *pick_lbl = lv_label_create(pick_row);
+    lv_label_set_text(pick_lbl, "WiFi Networks");
+    lv_obj_align(pick_lbl, LV_ALIGN_LEFT_MID, 10, 0);
+
+    lv_obj_t *pick_arrow = lv_label_create(pick_row);
+    lv_label_set_text(pick_arrow, LV_SYMBOL_RIGHT);
+    lv_obj_align(pick_arrow, LV_ALIGN_RIGHT_MID, -10, 0);
+
+
+    ip_lbl = lv_label_create(wifi_row);
+    lv_label_set_text(ip_lbl, g_ip_str);
+    lv_obj_align(ip_lbl, LV_ALIGN_LEFT_MID, 10, 10);
+    lv_obj_set_style_text_color(ip_lbl, lv_color_white(), 0);
+
+    lv_obj_t *wifi_sw = lv_switch_create(wifi_row);
+    lv_obj_align(wifi_sw, LV_ALIGN_RIGHT_MID, -10, 0);
+    if (g_wifi_on) lv_obj_add_state(wifi_sw, LV_STATE_CHECKED);
+    else lv_obj_clear_state(wifi_sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(wifi_sw, on_wifi_toggle, LV_EVENT_VALUE_CHANGED, NULL);
+
+
+    // Row 2: Set Time
+    lv_obj_t *settime_row = lv_btn_create(box);
+    lv_obj_set_size(settime_row, lv_pct(100), 70);
+    lv_obj_add_event_cb(settime_row, on_open_settime, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *settime_lbl = lv_label_create(settime_row);
+    lv_label_set_text(settime_lbl, "Set Time");
+    lv_obj_align(settime_lbl, LV_ALIGN_LEFT_MID, 10, 0);
+
+    lv_obj_t *settime_arrow = lv_label_create(settime_row);
+    lv_label_set_text(settime_arrow, LV_SYMBOL_RIGHT);
+    lv_obj_align(settime_arrow, LV_ALIGN_RIGHT_MID, -10, 0);
+
+    // Row 3: 24h toggle
+    lv_obj_t *fmt_row = lv_obj_create(box);
+    lv_obj_set_size(fmt_row, lv_pct(100), 70);
+    lv_obj_set_style_bg_opa(fmt_row, LV_OPA_0, 0);
+    lv_obj_clear_flag(fmt_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *fmt_lbl = lv_label_create(fmt_row);
+    lv_label_set_text(fmt_lbl, "24h Time");
+    lv_obj_align(fmt_lbl, LV_ALIGN_LEFT_MID, 10, 0);
+
+    lv_obj_t *fmt_sw = lv_switch_create(fmt_row);
+    lv_obj_align(fmt_sw, LV_ALIGN_RIGHT_MID, -10, 0);
+
+    if (use_24h_format) lv_obj_add_state(fmt_sw, LV_STATE_CHECKED);
+    else lv_obj_clear_state(fmt_sw, LV_STATE_CHECKED);
+
+    lv_obj_add_event_cb(fmt_sw, on_time_format_changed, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Row 4: Brightness slider
+    lv_obj_t *br_row = lv_obj_create(box);
+    lv_obj_set_size(br_row, lv_pct(100), 120);
+    lv_obj_set_style_bg_opa(br_row, LV_OPA_0, 0);
+    lv_obj_clear_flag(br_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *br_lbl = lv_label_create(br_row);
+    lv_label_set_text(br_lbl, "Brightness");
+    lv_obj_align(br_lbl, LV_ALIGN_TOP_LEFT, 10, 10);
+
+    brightness_slider = lv_slider_create(br_row);
+    lv_obj_set_width(brightness_slider, 260);
+    lv_obj_align(brightness_slider, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_slider_set_range(brightness_slider, 0, 100);
+    lv_slider_set_value(brightness_slider, g_brightness, LV_ANIM_OFF);
+    lv_obj_add_event_cb(brightness_slider, on_brightness_changed, LV_EVENT_VALUE_CHANGED, NULL);
+
+    return scr;
+}
+
+/* ---------------- UI Router ---------------- */
+
+static void ui_show(ui_screen_t s)
+{
+    if (s == UI_HOME) {
+        if (!scr_home) scr_home = build_home_screen();
+        lv_scr_load(scr_home);
+    } else if (s == UI_CLOCK) {
+        if (!scr_clock) scr_clock = build_clock_screen();
+        lv_scr_load(scr_clock);
+        clock_update_label_now();
+    } else if (s == UI_SETTINGS) {
+        if (!scr_settings) scr_settings = build_settings_screen();
+        lv_scr_load(scr_settings);
+        ui_update_ip_label();
+    }
+}
+
+static void create_watch_ui(void)
+{
+    ui_show(UI_CLOCK);
+}
+
+/* ---------------- App Entry ---------------- */
+
+static void init_logs_and_chipinfo(void)
+{
+    esp_chip_info_t chip_info;
+    uint32_t flash_size = 0;
+
+    esp_chip_info(&chip_info);
+
+    ESP_LOGI(TAG, "Chip: %s, cores: %d, features: %s%s%s%s",
+             CONFIG_IDF_TARGET,
+             chip_info.cores,
+             (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi/" : "",
+             (chip_info.features & CHIP_FEATURE_BT) ? "BT/" : "",
+             (chip_info.features & CHIP_FEATURE_BLE) ? "BLE/" : "",
+             (chip_info.features & CHIP_FEATURE_IEEE802154) ? "802.15.4" : "");
+
+    unsigned major_rev = chip_info.revision / 100;
+    unsigned minor_rev = chip_info.revision % 100;
+    ESP_LOGI(TAG, "Silicon revision v%d.%d", major_rev, minor_rev);
+
+    if (esp_flash_get_size(NULL, &flash_size) == ESP_OK) {
+        ESP_LOGI(TAG, "%" PRIu32 "MB flash", flash_size / (uint32_t)(1024 * 1024));
+    } else {
+        ESP_LOGW(TAG, "Get flash size failed");
+    }
+
+    ESP_LOGI(TAG, "Minimum free heap: %" PRIu32 " bytes", esp_get_minimum_free_heap_size());
+    ESP_LOGI(TAG, "Free PSRAM: %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+void setup(void);
+
+#if !CONFIG_AUTOSTART_ARDUINO
+void app_main(void)
+{
+    setup();
+}
+#endif
+
+void setup(void)
+{
+    esp_log_level_set("*", ESP_LOG_INFO);
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+
+    logSection("Smartwatch start");
+    init_logs_and_chipinfo();
+
+    logSection("Initialize NVS settings");
+    settings_nvs_init();
+    settings_load_from_nvs();
+
+    logSection("Initialize panel device");
+
+    bsp_display_cfg_t cfg = {
+        .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
+        .buffer_size   = EXAMPLE_LCD_QSPI_H_RES * EXAMPLE_LCD_QSPI_V_RES,
+#if LVGL_PORT_ROTATION_DEGREE == 90
+        .rotate = LV_DISP_ROT_90,
+#elif LVGL_PORT_ROTATION_DEGREE == 270
+        .rotate = LV_DISP_ROT_270,
+#elif LVGL_PORT_ROTATION_DEGREE == 180
+        .rotate = LV_DISP_ROT_180,
+#else
+        .rotate = LV_DISP_ROT_NONE,
+#endif
+    };
+
+    bsp_display_start_with_config(&cfg);
+
+    apply_backlight_percent(g_brightness);
+
+    logSection("Create UI");
+    bsp_display_lock(0);
+    create_watch_ui();
+    bsp_display_unlock();
+
+    // Start awake + baseline activity timestamp
+    g_last_activity_ms = lv_tick_get();
+    g_screen_awake = true;
+
+    // Sleep check timer
+    if (!sleep_timer) {
+        sleep_timer = lv_timer_create(sleep_timer_cb, 250, NULL);
+    }
+
+    // Touch poll timer (fixes Settings scrollable interactions)
+    if (!touch_activity_timer) {
+        touch_activity_timer = lv_timer_create(touch_activity_timer_cb, 80, NULL);
+    }
+    if (g_wifi_on && g_wifi_ssid[0]) {
+        ESP_LOGI(TAG, "Auto WiFi enabled from NVS -> starting STA");
+        wifi_start_sta(g_wifi_ssid, g_wifi_pass);
+    }
+
+
+
+    logSection("Smartwatch ready");
+}
+
+void loop(void)
+{
+    ESP_LOGI(TAG, "IDLE loop");
+}

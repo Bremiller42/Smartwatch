@@ -1,0 +1,2 @@
+source D:/esp32/JC3248W535EN-main/build/gdbinit/symbols
+source D:/esp32/JC3248W535EN-main/build/gdbinit/connect

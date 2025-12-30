@@ -1,0 +1,213 @@
+#include "watch_settings.h"
+#include "watch_globals.h"
+
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_err.h"
+
+const char *SET_TAG = "GLOBALS";
+
+
+void settings_nvs_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(SET_TAG, "NVS needs erase (%s). Erasing...", esp_err_to_name(err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "NVS init failed: %s", esp_err_to_name(err));
+        g_nvs_ok = false;
+        return;
+    }
+
+    err = nvs_open(NVS_NS, NVS_READWRITE, &g_nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "NVS open failed: %s", esp_err_to_name(err));
+        g_nvs_ok = false;
+        return;
+    }
+
+    g_nvs_ok = true;
+    ESP_LOGI(SET_TAG, "NVS ready (ns=%s)", NVS_NS);
+}
+
+void settings_load_wifi_creds(void)
+{
+    if (!g_nvs_ok) return;
+
+    size_t ssid_len = sizeof(g_wifi_ssid);
+    size_t pass_len = sizeof(g_wifi_pass);
+
+    esp_err_t e1 = nvs_get_str(g_nvs, KEY_WIFI_SSID, g_wifi_ssid, &ssid_len);
+    esp_err_t e2 = nvs_get_str(g_nvs, KEY_WIFI_PASS, g_wifi_pass, &pass_len);
+
+    if (e1 != ESP_OK) g_wifi_ssid[0] = '\0';
+    if (e2 != ESP_OK) g_wifi_pass[0] = '\0';
+}
+
+void settings_save_wifi_creds(const char *ssid, const char *pass)
+{
+    if (!g_nvs_ok) return;
+    if (!ssid) ssid = "";
+    if (!pass) pass = "";
+
+    nvs_set_str(g_nvs, KEY_WIFI_SSID, ssid);
+    nvs_set_str(g_nvs, KEY_WIFI_PASS, pass);
+    nvs_commit(g_nvs);
+
+    snprintf(g_wifi_ssid, sizeof(g_wifi_ssid), "%s", ssid);
+    snprintf(g_wifi_pass, sizeof(g_wifi_pass), "%s", pass);
+}
+
+void settings_load_from_nvs(void)
+{
+    if (!g_nvs_ok) return;
+
+    int32_t b = 0;
+    uint8_t u24 = 0;
+
+    esp_err_t err_b = nvs_get_i32(g_nvs, KEY_BRIGHTNESS, &b);
+    if (err_b == ESP_OK) {
+        g_brightness = (int)b;
+        if (g_brightness < 0) g_brightness = 0;
+        if (g_brightness > 100) g_brightness = 100;
+        ESP_LOGI(SET_TAG, "Loaded brightness=%d", g_brightness);
+    } else {
+        ESP_LOGW(SET_TAG, "Brightness not found (%s). Using default=%d",
+                 esp_err_to_name(err_b), g_brightness);
+    }
+
+    esp_err_t err_24 = nvs_get_u8(g_nvs, KEY_USE_24H, &u24);
+    if (err_24 == ESP_OK) {
+        use_24h_format = (u24 != 0);
+        ESP_LOGI(SET_TAG, "Loaded use24h=%d", (int)use_24h_format);
+    } else {
+        ESP_LOGW(SET_TAG, "use24h not found (%s). Using default=%d",
+                 esp_err_to_name(err_24), (int)use_24h_format);
+    }
+
+    uint8_t won = 0;
+    esp_err_t err_w = nvs_get_u8(g_nvs, KEY_WIFI_ON, &won);
+    if (err_w == ESP_OK) {
+        g_wifi_on = (won != 0);
+        ESP_LOGI(SET_TAG, "Loaded wifi_on=%d", (int)g_wifi_on);
+    } else {
+        ESP_LOGW(SET_TAG, "wifi_on not found (%s). Using default=%d",
+                 esp_err_to_name(err_w), (int)g_wifi_on);
+    }
+    settings_load_wifi_creds();
+    uint32_t sto = 15;
+    esp_err_t err_sto = nvs_get_u32(g_nvs, KEY_SCREEN_TIMEOUT, &sto);
+    if (err_sto == ESP_OK) {
+        if (sto != 15 && sto != 30 && sto != 60) sto = 15;
+        g_screen_timeout_ms = sto * 1000;
+        ESP_LOGI(SET_TAG, "Loaded screen_timeout=%us", (unsigned)sto);
+    } else {
+        ESP_LOGW(SET_TAG, "screen_timeout not found (%s). Using default=%ums",
+                esp_err_to_name(err_sto), (unsigned)g_screen_timeout_ms);
+    }
+    uint8_t bon = 0;
+    esp_err_t err_ble = nvs_get_u8(g_nvs, KEY_BLE_ON, &bon);
+    if (err_ble == ESP_OK) {
+        g_ble_on = (bon != 0);
+        ESP_LOGI(SET_TAG, "Loaded ble_on=%d", (int)g_ble_on);
+    } else {
+        ESP_LOGW(SET_TAG, "ble_on not found (%s). Using default=%d",
+                esp_err_to_name(err_ble), (int)g_ble_on);
+    }
+    
+
+}
+
+void settings_save_screen_timeout_s(uint32_t seconds)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(SET_TAG, "Save screen timeout skipped (NVS not ready)");
+        return;
+    }
+
+    if (seconds != 15 && seconds != 30 && seconds != 60) seconds = 15;
+
+    esp_err_t err = nvs_set_u32(g_nvs, KEY_SCREEN_TIMEOUT, seconds);
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "Save screen timeout set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_commit(g_nvs);
+    ESP_LOGI(SET_TAG, "Saved screen_timeout=%us (%s)", (unsigned)seconds, esp_err_to_name(err));
+}
+
+
+void settings_save_brightness(int bright)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(SET_TAG, "Save brightness skipped (NVS not ready)");
+        return;
+    }
+
+    if (bright < 0) bright = 0;
+    if (bright > 100) bright = 100;
+
+    esp_err_t err = nvs_set_i32(g_nvs, KEY_BRIGHTNESS, (int32_t)bright);
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "Save brightness set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_commit(g_nvs);
+    ESP_LOGI(SET_TAG, "Saved brightness=%d (%s)", bright, esp_err_to_name(err));
+}
+
+void settings_save_24h(bool use24)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(SET_TAG, "Save use24h skipped (NVS not ready)");
+        return;
+    }
+
+    esp_err_t err = nvs_set_u8(g_nvs, KEY_USE_24H, use24 ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "Save use24h set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_commit(g_nvs);
+    ESP_LOGI(SET_TAG, "Saved use24h=%d (%s)", (int)use24, esp_err_to_name(err));
+}
+
+void settings_save_wifi(bool on)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(SET_TAG, "Save wifi_on skipped (NVS not ready)");
+        return;
+    }
+
+    esp_err_t err = nvs_set_u8(g_nvs, KEY_WIFI_ON, on ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "Save wifi_on set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_commit(g_nvs);
+    ESP_LOGI(SET_TAG, "Saved wifi_on=%d (%s)", (int)on, esp_err_to_name(err));
+}
+void settings_save_ble(bool on)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(SET_TAG, "Save ble_on skipped (NVS not ready)");
+        return;
+    }
+
+    esp_err_t err = nvs_set_u8(g_nvs, KEY_BLE_ON, on ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "Save ble_on set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_commit(g_nvs);
+    ESP_LOGI(SET_TAG, "Saved ble_on=%d (%s)", (int)on, esp_err_to_name(err));
+}
