@@ -905,24 +905,6 @@ static void on_ble_toggle(lv_event_t *e)
     mark_user_activity();
 }
 
-static void on_timeout_changed(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-
-    lv_obj_t *dd = lv_event_get_target(e);
-    uint16_t sel = lv_dropdown_get_selected(dd);
-
-    uint32_t seconds = 15;
-    if (sel == 0) seconds = 15;
-    else if (sel == 1) seconds = 30;
-    else if (sel == 2) seconds = 60;
-
-    g_screen_timeout_ms = seconds * 1000;
-    settings_save_screen_timeout_s(seconds);
-
-    mark_user_activity();
-}
-
 /* ---------------- Screens ---------------- */
 
 static lv_obj_t *build_home_screen(void)
@@ -1004,20 +986,6 @@ static lv_obj_t *build_settings_screen(void)
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_add_event_cb(scr, activity_event_cb, LV_EVENT_ALL, NULL);
-
-    // Top-left back button (overlay)
-    lv_obj_t *back = lv_btn_create(scr);
-    lv_obj_set_size(back, 40, 40);
-    lv_obj_set_style_radius(back, 12, 0);
-    lv_obj_set_style_bg_color(back, lv_color_hex(0x101010), 0);
-    lv_obj_set_style_bg_opa(back, LV_OPA_COVER, 0);
-    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 8, 8);
-    lv_obj_add_event_cb(back, on_settings_back, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *btxt = lv_label_create(back);
-    lv_label_set_text(btxt, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_color(btxt, lv_color_white(), 0);
-    lv_obj_center(btxt);
 
     // TabView: Display / Network / Time&Date
     lv_obj_t *tv = lv_tabview_create(scr, LV_DIR_TOP, 48);
@@ -1158,6 +1126,19 @@ static lv_obj_t *build_settings_screen(void)
     tile_set_on(t_sync, true);
     lv_obj_set_grid_cell(t_sync, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 1, 1);
 
+    // Top-left back button (overlay)
+    lv_obj_t *back = lv_btn_create(scr);
+    lv_obj_set_size(back, 20, 20);
+    lv_obj_set_style_radius(back, 4, 0);
+    lv_obj_set_style_bg_color(back, lv_color_hex(0x101010), 0);
+    lv_obj_set_style_bg_opa(back, 0, 0);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 8, 8);
+    lv_obj_add_event_cb(back, on_settings_back, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *btxt = lv_label_create(back);
+    lv_label_set_text(btxt, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(btxt, lv_color_white(), 0);
+    lv_obj_center(btxt);
     return scr;
 }
 
