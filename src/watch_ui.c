@@ -208,6 +208,14 @@ void ui_update_ble_icon_async(void *arg)
     clock_update_ble_icon_now();
     bsp_display_unlock();
 }
+void ui_ble_pump_updates(void)
+{
+    if (!ble_ui_take_dirty()) return;
+
+    // Now we're in the LVGL/UI context (timer), so lv_async_call is safe
+    lv_async_call(ui_update_ble_icon_async, NULL);
+    lv_async_call(ui_update_ble_status_async, NULL);
+}
 
 
 static void clock_timer_cb(lv_timer_t *t)
@@ -217,6 +225,7 @@ static void clock_timer_cb(lv_timer_t *t)
     if (!g_screen_awake) return;
 
     clock_update_label_now();
+    ui_ble_pump_updates();
 
     static int tick = 0;
     tick++;
@@ -225,6 +234,7 @@ static void clock_timer_cb(lv_timer_t *t)
         clock_update_ble_icon_now();
     }
 }
+
 
 /* ---------------- WiFi Picker Modal ---------------- */
 

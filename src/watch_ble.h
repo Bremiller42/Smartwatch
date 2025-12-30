@@ -23,6 +23,10 @@ void ble_stop(void);
 /** True if we currently have a BLE connection */
 bool ble_is_connected(void);
 
+void ble_ui_mark_dirty_from_ble_thread(void);
+bool ble_ui_take_dirty(void);
+
+
 /**
  * Optional: send a notify out on TX characteristic (if phone subscribed).
  * Returns ESP_OK if queued, otherwise error.
