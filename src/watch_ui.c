@@ -1,9 +1,8 @@
-// watch_ui.c (single-file, complete, all-together version)
-// - Settings screen rebuilt as a NON-scrollable GRID of tiles
-// - Switch tiles: tapping tile toggles switch (and runs your existing callbacks)
-// - Nav tiles: open modals/screens
-// - Brightness opens as an overlay modal with slider
-// - Grid uses LV_GRID_FR() (fixes “1px tracks / empty black box” issue)
+// watch_ui.c (single-file, complete, cleaned version)
+// - Settings screen: NON-scrollable TabView (Display / Network / Time&Date)
+// - Tiles: rounded square tiles; switch-tiles are color-only (no visible switch)
+// - Notifications: uses ONLY the new notif_bar (no old notif_chip/notif_icon_row code)
+// - Safe refresh path: all UI updates funnel through lv_async_call()
 
 #include "watch_ui.h"
 #include "watch_wifi.h"
@@ -23,6 +22,8 @@
 
 #include <stdio.h>
 #include <time.h>
+#include <string.h>
+#include <inttypes.h>
 
 /* ---------------- Tag ---------------- */
 static const char *UI_TAG = "UI";
@@ -31,6 +32,7 @@ static const char *UI_TAG = "UI";
 static lv_obj_t *build_home_screen(void);
 static lv_obj_t *build_clock_screen(void);
 static lv_obj_t *build_settings_screen(void);
+static lv_obj_t *build_black_screen(void);
 
 static void on_back_to_home(lv_event_t * e);
 static void on_open_clock(lv_event_t * e);
@@ -59,14 +61,39 @@ static void on_dec_min(lv_event_t *e);
 
 static void clock_timer_cb(lv_timer_t *t);
 
-
 void on_wifi_pass_cancel(lv_event_t *e);
 void on_wifi_pass_connect(lv_event_t *e);
 
 static void on_ble_toggle(lv_event_t *e);
-void ui_update_ble_status_async(void *arg); 
+void ui_update_ble_status_async(void *arg);
+void ui_update_ble_icon_async(void *arg);
 
+/* ---------------- Misc UI state ---------------- */
 static lv_obj_t *timeout_sub_lbl = NULL;
+
+/* ---------------- Notifications (NEW BAR ONLY) ---------------- */
+#define NOTIF_ICON_W 28
+#define NOTIF_ICON_H 28
+#define NOTIF_GAP    10
+
+static lv_obj_t *notif_bar = NULL;                   // container (clock screen)
+static lv_obj_t *notif_slot[NOTIF_MAX] = {0};        // each icon slot
+
+
+static void notif_icons_refresh(void);
+
+static void ui_notif_refresh_cb(void *arg)
+{
+    (void)arg;
+    notif_icons_refresh();
+    g_notif_dirty = false;
+}
+
+void ui_notif_refresh_async(void)
+{
+    // safe to call from anywhere (ble task, sleep task, etc)
+    lv_async_call(ui_notif_refresh_cb, NULL);
+}
 
 /* ---------------- UI Helpers ---------------- */
 
@@ -106,6 +133,7 @@ void ui_update_wifi_icon_async(void *arg)
     clock_update_wifi_icon_now();
     bsp_display_unlock();
 }
+
 void ui_update_ble_status_async(void *arg)
 {
     (void)arg;
@@ -124,7 +152,6 @@ void ui_update_ble_status_async(void *arg)
 
     bsp_display_unlock();
 }
-
 
 /* ---------------- Clock ---------------- */
 
@@ -174,29 +201,28 @@ void clock_update_wifi_icon_now(void)
         lv_obj_set_style_text_opa(clock_wifi_icon, LV_OPA_COVER, 0);
         return;
     }
-    // You can map RSSI to different icons later; for now keep 1 icon
+
+    // Map RSSI later if you want; keep single icon for now
     lv_label_set_text(clock_wifi_icon, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_opa(clock_wifi_icon, LV_OPA_COVER, 0);
 }
+
 void clock_update_ble_icon_now(void)
 {
     if (!clock_ble_icon) return;
 
-    // If BLE is disabled
     if (!g_ble_on) {
         lv_label_set_text(clock_ble_icon, LV_SYMBOL_BLUETOOTH);
         lv_obj_set_style_text_opa(clock_ble_icon, LV_OPA_30, 0);
         return;
     }
 
-    // Enabled but not connected
     if (!g_ble_connected) {
         lv_label_set_text(clock_ble_icon, LV_SYMBOL_BLUETOOTH);
         lv_obj_set_style_text_opa(clock_ble_icon, LV_OPA_60, 0);
         return;
     }
 
-    // Connected
     lv_label_set_text(clock_ble_icon, LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_opa(clock_ble_icon, LV_OPA_COVER, 0);
 }
@@ -208,15 +234,15 @@ void ui_update_ble_icon_async(void *arg)
     clock_update_ble_icon_now();
     bsp_display_unlock();
 }
+
 void ui_ble_pump_updates(void)
 {
     if (!ble_ui_take_dirty()) return;
 
-    // Now we're in the LVGL/UI context (timer), so lv_async_call is safe
+    // Called from UI timer -> ok to schedule async updates
     lv_async_call(ui_update_ble_icon_async, NULL);
     lv_async_call(ui_update_ble_status_async, NULL);
 }
-
 
 static void clock_timer_cb(lv_timer_t *t)
 {
@@ -233,8 +259,93 @@ static void clock_timer_cb(lv_timer_t *t)
         clock_update_wifi_icon_now();
         clock_update_ble_icon_now();
     }
+
+    // Refresh notif bar if something dirtied it
+    if (g_notif_dirty) {
+        notif_icons_refresh();
+        g_notif_dirty = false;
+    }
 }
 
+/* ---------------- Notifications Bar ---------------- */
+
+static void notif_bar_set_hidden_if_empty(void)
+{
+    if (!notif_bar) return;
+
+    uint32_t total = 0;
+    for (int i = 0; i < NOTIF_MAX; i++) total += g_notif_counts[i];
+
+    if (total == 0) lv_obj_add_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
+    else            lv_obj_clear_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void notif_icons_refresh(void)
+{
+    if (!notif_bar) return;
+
+    for (int i = 0; i < NOTIF_MAX; i++) {
+        if (!notif_slot[i]) continue;
+
+        uint16_t c = g_notif_counts[i];
+
+        if (c == 0) {
+            lv_obj_add_flag(notif_slot[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+
+        lv_obj_clear_flag(notif_slot[i], LV_OBJ_FLAG_HIDDEN);
+
+        // Badge: 1..99+
+        char b[8];
+        if (c > 99) strcpy(b, "99+");
+        else snprintf(b, sizeof(b), "%u", (unsigned)c);
+
+        lv_label_set_text(notif_badge_lbl[i], b);
+    }
+
+    notif_bar_set_hidden_if_empty();
+}
+
+void ui_notif_add(notif_type_t t)
+{
+    if (t < 0 || t >= NOTIF_MAX) return;
+    if (g_notif_counts[t] < 999) g_notif_counts[t]++;
+
+    g_notif_dirty = true;
+    ui_notif_refresh_async();
+
+    ESP_LOGI(UI_TAG, "notif add type=%d count=%u", (int)t, (unsigned)g_notif_counts[t]);
+}
+
+void ui_notif_clear_type(notif_type_t t)
+{
+    if (t < 0 || t >= NOTIF_MAX) return;
+    g_notif_counts[t] = 0;
+
+    g_notif_dirty = true;
+    ui_notif_refresh_async();
+}
+
+void ui_notif_clear_all(void)
+{
+    for (int i = 0; i < NOTIF_MAX; i++) g_notif_counts[i] = 0;
+
+    g_notif_dirty = true;
+    ui_notif_refresh_async();
+}
+
+/* Call this from BLE thread safely */
+static void ui_notif_add_async_cb(void *arg)
+{
+    notif_type_t t = (notif_type_t)(intptr_t)arg;
+    ui_notif_add(t);
+}
+
+void ui_notif_add_from_ble(notif_type_t t)
+{
+    lv_async_call(ui_notif_add_async_cb, (void*)(intptr_t)t);
+}
 
 /* ---------------- WiFi Picker Modal ---------------- */
 
@@ -316,7 +427,6 @@ void on_wifi_ap_clicked(lv_event_t *e)
     ssid[i] = '\0';
 
     snprintf(g_selected_ssid, sizeof(g_selected_ssid), "%s", ssid);
-
     open_wifi_password_modal(lv_scr_act(), g_selected_ssid);
 }
 
@@ -569,8 +679,7 @@ static void on_open_settime(lv_event_t *e)
     }
 }
 
-
-/* ---------------- Brightness Modal (NEW) ---------------- */
+/* ---------------- Brightness Modal ---------------- */
 
 static lv_obj_t *brightness_modal = NULL;
 
@@ -623,7 +732,7 @@ static void on_open_brightness(lv_event_t *e)
     open_brightness_modal(lv_scr_act());
 }
 
-/* ---------------- Tile Helpers (NEW: tabbed, non-scrollable, no visible switches) ---------------- */
+/* ---------------- Tile Helpers (tabbed, non-scrollable, no visible switches) ---------------- */
 
 #define TILE_W   130
 #define TILE_H   100
@@ -635,7 +744,7 @@ static lv_color_t TILE_BORDER(void) { return lv_color_hex(0x3A3A3A); }
 
 typedef struct {
     lv_obj_t *tile_btn;   // visible tile
-    lv_obj_t *hidden_sw;  // hidden switch used only to reuse your existing callbacks
+    lv_obj_t *hidden_sw;  // hidden switch used only to reuse callbacks
     lv_obj_t *sub_lbl;    // optional subtitle label
 } tile_switch_ctx_t;
 
@@ -646,7 +755,6 @@ static void tile_style_base(lv_obj_t *btn)
     lv_obj_set_style_border_width(btn, 2, 0);
     lv_obj_set_style_border_color(btn, TILE_BORDER(), 0);
     lv_obj_set_style_pad_all(btn, 12, 0);
-
     lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
 }
 
@@ -688,12 +796,10 @@ static lv_obj_t *tile_create_nav_tile(lv_obj_t *parent,
     lv_obj_t *sub = NULL;
     lv_obj_t *btn = tile_create_base(parent, title, subtitle, &sub);
 
-    // Nav tiles are always blue
-    tile_set_on(btn, true);
+    tile_set_on(btn, true); // nav tiles always blue
 
     if (on_click) lv_obj_add_event_cb(btn, on_click, LV_EVENT_CLICKED, NULL);
 
-    // Optional arrow indicator (subtle)
     lv_obj_t *arrow = lv_label_create(btn);
     lv_label_set_text(arrow, LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_color(arrow, lv_color_white(), 0);
@@ -715,22 +821,20 @@ static void on_switch_tile_clicked(lv_event_t *e)
     if (now_on) lv_obj_add_state(ctx->hidden_sw, LV_STATE_CHECKED);
     else        lv_obj_clear_state(ctx->hidden_sw, LV_STATE_CHECKED);
 
-    // update tile color
     tile_set_on(ctx->tile_btn, now_on);
 
-    // run your existing handler (expects LV_EVENT_VALUE_CHANGED on the switch)
+    // reuse existing callback (expects VALUE_CHANGED on switch)
     lv_event_send(ctx->hidden_sw, LV_EVENT_VALUE_CHANGED, NULL);
 
     mark_user_activity();
 }
+
 static void on_tile_ctx_cleanup(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_DELETE) return;
     tile_switch_ctx_t *ctx = (tile_switch_ctx_t *)lv_event_get_user_data(e);
     if (ctx) lv_mem_free(ctx);
 }
-
-
 
 static lv_obj_t *tile_create_switch_tile(lv_obj_t *parent,
                                         const char *title,
@@ -742,9 +846,9 @@ static lv_obj_t *tile_create_switch_tile(lv_obj_t *parent,
     lv_obj_t *sub = NULL;
     lv_obj_t *btn = tile_create_base(parent, title, subtitle, &sub);
 
-    // Hidden switch exists ONLY so your existing callbacks still work
+    // Hidden switch exists ONLY so existing callbacks still work
     lv_obj_t *sw = lv_switch_create(btn);
-    lv_obj_add_flag(sw, LV_OBJ_FLAG_HIDDEN);          // not visible
+    lv_obj_add_flag(sw, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_size(sw, 1, 1);
     lv_obj_set_style_opa(sw, LV_OPA_0, 0);
 
@@ -755,21 +859,21 @@ static lv_obj_t *tile_create_switch_tile(lv_obj_t *parent,
         lv_obj_add_event_cb(sw, on_switch_value_changed, LV_EVENT_VALUE_CHANGED, NULL);
     }
 
-    // Tile starts in correct color
     tile_set_on(btn, initial_on);
 
-    // click handler context
     tile_switch_ctx_t *ctx = (tile_switch_ctx_t *)lv_mem_alloc(sizeof(tile_switch_ctx_t));
     ctx->tile_btn   = btn;
     ctx->hidden_sw  = sw;
     ctx->sub_lbl    = sub;
 
     lv_obj_add_event_cb(btn, on_switch_tile_clicked, LV_EVENT_CLICKED, ctx);
-    lv_obj_add_event_cb(btn, on_tile_ctx_cleanup, LV_EVENT_DELETE, ctx);
+    lv_obj_add_event_cb(btn, on_tile_ctx_cleanup,   LV_EVENT_DELETE,  ctx);
 
     if (out_sub_lbl) *out_sub_lbl = sub;
     return btn;
 }
+
+/* ---------------- Timeout tile ---------------- */
 
 static uint32_t timeout_get_s(void)
 {
@@ -803,7 +907,6 @@ static void on_timeout_tile_clicked(lv_event_t *e)
     timeout_update_subtitle();
     mark_user_activity();
 }
-
 
 /* ---------------- UI Callbacks ---------------- */
 
@@ -880,6 +983,7 @@ static void on_wifi_toggle(lv_event_t *e)
 
     mark_user_activity();
 }
+
 static void on_ble_toggle(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
@@ -899,8 +1003,9 @@ static void on_ble_toggle(lv_event_t *e)
         g_ble_connected = false;
         lv_async_call(ui_update_ble_status_async, NULL);
     }
+
     lv_async_call(ui_update_ble_icon_async, NULL);
-    ui_update_ble_status_async(NULL);
+    lv_async_call(ui_update_ble_status_async, NULL);
 
     mark_user_activity();
 }
@@ -944,19 +1049,22 @@ static lv_obj_t *build_clock_screen(void)
     lv_obj_set_style_text_color(clock_time_lbl, lv_color_white(), 0);
     lv_obj_align(clock_time_lbl, LV_ALIGN_TOP_MID, 0, 30);
 
-    clock_update_label_now();
-
     clock_date_lbl = lv_label_create(scr);
     lv_obj_set_style_text_font(clock_date_lbl, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(clock_date_lbl, lv_color_white(), 0);
     lv_obj_align(clock_date_lbl, LV_ALIGN_TOP_LEFT, 5, 5);
-    clock_update_label_now();
 
     clock_wifi_icon = lv_label_create(scr);
     lv_obj_set_style_text_color(clock_wifi_icon, lv_color_white(), 0);
     lv_obj_align(clock_wifi_icon, LV_ALIGN_TOP_RIGHT, -12, 12);
     lv_label_set_text(clock_wifi_icon, LV_SYMBOL_WIFI);
 
+    clock_ble_icon = lv_label_create(scr);
+    lv_obj_set_style_text_color(clock_ble_icon, lv_color_white(), 0);
+    lv_obj_align_to(clock_ble_icon, clock_wifi_icon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
+    lv_label_set_text(clock_ble_icon, LV_SYMBOL_BLUETOOTH);
+
+    clock_update_label_now();
     clock_update_wifi_icon_now();
     clock_update_ble_icon_now();
 
@@ -972,19 +1080,56 @@ static lv_obj_t *build_clock_screen(void)
     lv_label_set_text(lv_label_create(menu), LV_SYMBOL_HOME);
     lv_obj_center(lv_obj_get_child(menu, 0));
 
-    clock_ble_icon = lv_label_create(scr);
-    lv_obj_set_style_text_color(clock_ble_icon, lv_color_white(), 0);
-    lv_obj_align_to(clock_ble_icon, clock_wifi_icon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
-    lv_label_set_text(clock_ble_icon, LV_SYMBOL_BLUETOOTH);  // LVGL has this symbol
+    // --- Notification icon bar (fixed layout) ---
+    notif_bar = lv_obj_create(scr);
+    lv_obj_set_size(notif_bar, lv_pct(92), NOTIF_ICON_H);
+    lv_obj_align(notif_bar, LV_ALIGN_TOP_MID, 0, 120);
+    lv_obj_set_style_bg_opa(notif_bar, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(notif_bar, 0, 0);
+    lv_obj_clear_flag(notif_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    clock_notification_icon_box = lv_obj_create(scr);
-    lv_obj_set_size(clock_notification_icon_box, lv_pct(100), lv_pct(10));
-    lv_obj_align(clock_notification_icon_box, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_opa(clock_notification_icon_box, LV_OPA_0, 0);
-    lv_obj_set_style_border_width(clock_notification_icon_box, 2, 0);
-    lv_obj_set_style_border_color(clock_notification_icon_box, lv_color_white(), 0);
-    lv_obj_clear_flag(clock_notification_icon_box, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < NOTIF_MAX; i++) {
+        notif_slot[i] = lv_obj_create(notif_bar);
+        lv_obj_set_size(notif_slot[i], NOTIF_ICON_W, NOTIF_ICON_H);
+        lv_obj_set_style_radius(notif_slot[i], 8, 0);
+        lv_obj_set_style_bg_color(notif_slot[i], lv_color_hex(0x202020), 0);
+        lv_obj_set_style_bg_opa(notif_slot[i], LV_OPA_70, 0);
+        lv_obj_set_style_border_width(notif_slot[i], 1, 0);
+        lv_obj_set_style_border_color(notif_slot[i], lv_color_hex(0x505050), 0);
+        lv_obj_clear_flag(notif_slot[i], LV_OBJ_FLAG_SCROLLABLE);
 
+        // manual X positioning
+        lv_obj_align(notif_slot[i], LV_ALIGN_LEFT_MID,
+                     i * (NOTIF_ICON_W + NOTIF_GAP), 0);
+
+        // Icon label (centered)
+        notif_icon_lbl[i] = lv_label_create(notif_slot[i]);
+        lv_obj_set_style_text_color(notif_icon_lbl[i], lv_color_white(), 0);
+        lv_obj_set_style_text_font(notif_icon_lbl[i], &lv_font_montserrat_16, 0);
+        lv_label_set_text(notif_icon_lbl[i], "?");
+        lv_obj_center(notif_icon_lbl[i]);
+
+        // Badge label (top-right)
+        notif_badge_lbl[i] = lv_label_create(notif_slot[i]);
+        lv_obj_set_style_text_color(notif_badge_lbl[i], lv_color_white(), 0);
+        lv_obj_set_style_text_font(notif_badge_lbl[i], &lv_font_montserrat_12, 0);
+        lv_label_set_text(notif_badge_lbl[i], "");
+        lv_obj_align(notif_badge_lbl[i], LV_ALIGN_TOP_RIGHT, 4, -6);
+
+        lv_obj_add_flag(notif_slot[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Set icon glyphs ONCE (outside the loop)
+    lv_label_set_text(notif_icon_lbl[NOTIF_SMS],   "S");
+    lv_label_set_text(notif_icon_lbl[NOTIF_EMAIL], "E");
+    lv_label_set_text(notif_icon_lbl[NOTIF_MSG],   "M");
+    lv_label_set_text(notif_icon_lbl[NOTIF_APP],   "A");
+
+    // Hide bar until there’s at least one notif
+    lv_obj_add_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
+
+    // If counts already exist (e.g., you rebooted and restored), reflect them
+    notif_icons_refresh();
 
     return scr;
 }
@@ -1002,14 +1147,13 @@ static lv_obj_t *build_settings_screen(void)
     lv_obj_align(tv, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(tv, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(tv, LV_OPA_COVER, 0);
-    
-    // Make sure the content does NOT scroll
+
+    // Content should NOT scroll
     lv_obj_t *content = lv_tabview_get_content(tv);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(content, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(content, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(content, 0, 0);
-    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *tab_bar = lv_tabview_get_tab_btns(tv);
     lv_obj_set_style_bg_color(tab_bar, lv_color_black(), 0);
@@ -1019,8 +1163,7 @@ static lv_obj_t *build_settings_screen(void)
 
     lv_obj_set_style_text_color(tab_bar, lv_color_hex(0xAAAAAA), LV_PART_ITEMS | LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(tab_bar, lv_color_white(),      LV_PART_ITEMS | LV_STATE_CHECKED);
-
-    lv_obj_set_style_bg_opa(tab_bar, LV_OPA_0, LV_PART_ITEMS | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(tab_bar, LV_OPA_0,  LV_PART_ITEMS | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(tab_bar, LV_OPA_20, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_radius(tab_bar, 10, LV_PART_ITEMS);
 
@@ -1028,8 +1171,6 @@ static lv_obj_t *build_settings_screen(void)
     lv_obj_t *tab_network = lv_tabview_add_tab(tv, "Network");
     lv_obj_t *tab_time    = lv_tabview_add_tab(tv, "Time/Date");
 
-    // ---- Common grid builder (3 columns, 2 rows) ----
-    // We keep everything fully on-screen: no scrolling, just 6 tiles max per tab.
     static lv_coord_t col_dsc[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST };
     static lv_coord_t row_dsc[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST };
 
@@ -1045,24 +1186,15 @@ static lv_obj_t *build_settings_screen(void)
     lv_obj_clear_flag(g_disp, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_grid_dsc_array(g_disp, col_dsc, row_dsc);
 
-    // Brightness (nav -> modal)
     lv_obj_t *t_bright = tile_create_nav_tile(g_disp, "Brightness", "Adjust", on_open_brightness);
     lv_obj_set_grid_cell(t_bright, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 0, 1);
 
-    // Timeout (tap tile to cycle 15/30/60)
     lv_obj_t *t_timeout = tile_create_base(g_disp, "Timeout", "", &timeout_sub_lbl);
-    tile_set_on(t_timeout, true); // setting tile (blue)
-
-    // keep your grid placement (centered)
+    tile_set_on(t_timeout, true);
     lv_obj_set_grid_cell(t_timeout, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 0, 1);
-
-    // set initial subtitle text based on current g_screen_timeout_ms
     timeout_update_subtitle();
-
-    // tap tile cycles
     lv_obj_add_event_cb(t_timeout, on_timeout_tile_clicked, LV_EVENT_CLICKED, NULL);
 
-    // (optional placeholders if you want 4 tiles max)
     lv_obj_t *t_placeholder1 = tile_create_base(g_disp, "Theme", "Later", NULL);
     tile_set_on(t_placeholder1, false);
     lv_obj_set_grid_cell(t_placeholder1, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 1, 1);
@@ -1083,26 +1215,24 @@ static lv_obj_t *build_settings_screen(void)
     lv_obj_clear_flag(g_net, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_grid_dsc_array(g_net, col_dsc, row_dsc);
 
-    // WiFi toggle tile (subtitle label becomes ip_lbl)
     lv_obj_t *wifi_sub = NULL;
     lv_obj_t *t_wifi = tile_create_switch_tile(g_net, "WiFi", g_ip_str, g_wifi_on, on_wifi_toggle, &wifi_sub);
     lv_obj_set_grid_cell(t_wifi, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 0, 1);
-    ip_lbl = wifi_sub; // keep your existing async updater working
+    ip_lbl = wifi_sub;
 
-    // Networks (nav -> picker modal) always blue
-    lv_obj_t *t_networks = tile_create_nav_tile(g_net, "Networks",
+    lv_obj_t *t_networks = tile_create_nav_tile(
+        g_net, "Networks",
         (g_wifi_ssid[0] != '\0') ? g_wifi_ssid : "Choose WiFi",
-        on_open_wifi_picker);
+        on_open_wifi_picker
+    );
     lv_obj_set_grid_cell(t_networks, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 0, 1);
 
-    // BLE toggle (subtitle becomes ble_status_lbl)
     lv_obj_t *ble_sub = NULL;
     lv_obj_t *t_ble = tile_create_switch_tile(g_net, "BLE", "Off", g_ble_on, on_ble_toggle, &ble_sub);
     lv_obj_set_grid_cell(t_ble, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 1, 1);
     ble_status_lbl = ble_sub;
-    ui_update_ble_status_async(NULL);
+    lv_async_call(ui_update_ble_status_async, NULL);
 
-    // Notifications placeholder (nav style or just a tile)
     lv_obj_t *t_notif = tile_create_nav_tile(g_net, "Notifications", "Coming soon", NULL);
     lv_obj_set_grid_cell(t_notif, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 1, 1);
 
@@ -1118,15 +1248,12 @@ static lv_obj_t *build_settings_screen(void)
     lv_obj_clear_flag(g_time, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_grid_dsc_array(g_time, col_dsc, row_dsc);
 
-    // 24h toggle
     lv_obj_t *t_24h = tile_create_switch_tile(g_time, "24h Time", "", use_24h_format, on_time_format_changed, NULL);
     lv_obj_set_grid_cell(t_24h, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 0, 1);
 
-    // Set Time nav
     lv_obj_t *t_set = tile_create_nav_tile(g_time, "Set Time", "Manual", on_open_settime);
     lv_obj_set_grid_cell(t_set, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 0, 1);
 
-    // placeholders
     lv_obj_t *t_date = tile_create_base(g_time, "Date", "Later", NULL);
     tile_set_on(t_date, false);
     lv_obj_set_grid_cell(t_date, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 1, 1);
@@ -1148,6 +1275,7 @@ static lv_obj_t *build_settings_screen(void)
     lv_label_set_text(btxt, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(btxt, lv_color_white(), 0);
     lv_obj_center(btxt);
+
     return scr;
 }
 
@@ -1160,7 +1288,6 @@ static lv_obj_t *build_black_screen(void)
     return scr;
 }
 
-
 /* ---------------- Router ---------------- */
 
 void ui_show(ui_screen_t s)
@@ -1168,10 +1295,16 @@ void ui_show(ui_screen_t s)
     if (s == UI_HOME) {
         if (!scr_home) scr_home = build_home_screen();
         lv_scr_load(scr_home);
+
     } else if (s == UI_CLOCK) {
         if (!scr_clock) scr_clock = build_clock_screen();
         lv_scr_load(scr_clock);
+
+        // reflect current state
         clock_update_label_now();
+        notif_icons_refresh();
+        g_notif_dirty = false;
+
     } else if (s == UI_SETTINGS) {
         if (scr_settings) {
             lv_obj_del(scr_settings);
@@ -1180,6 +1313,7 @@ void ui_show(ui_screen_t s)
         if (!scr_settings) scr_settings = build_settings_screen();
         lv_scr_load(scr_settings);
         ui_update_ip_label();
+
     } else if (s == UI_BLANK) {
         if (!scr_blank) scr_blank = build_black_screen();
         lv_scr_load(scr_blank);

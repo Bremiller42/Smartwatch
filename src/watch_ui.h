@@ -30,3 +30,6 @@ void on_wifi_ap_clicked(lv_event_t *e);
 void clock_update_ble_icon_now(void);
 void ui_update_ble_icon_async(void *arg);
 void ui_update_ble_status_async(void *arg);
+// watch_ui.h
+void ui_notif_add_from_ble(notif_type_t t);
+void ui_notif_refresh_async(void);

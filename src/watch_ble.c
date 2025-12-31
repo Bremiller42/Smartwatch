@@ -65,6 +65,16 @@ bool ble_ui_take_dirty(void)
     s_ble_ui_dirty = false;
     return true;
 }
+static notif_type_t notif_type_from_str(const char *s)
+{
+    if (!s) return NOTIF_APP;
+    if (strcmp(s, "SMS") == 0)   return NOTIF_SMS;
+    if (strcmp(s, "EMAIL") == 0) return NOTIF_EMAIL;
+    if (strcmp(s, "MSG") == 0)   return NOTIF_MSG;
+    if (strcmp(s, "TEST") == 0)  return NOTIF_APP; // your test type
+    return NOTIF_APP;
+}
+
 
 /* ---------------- RX write handler ---------------- */
 static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -88,11 +98,30 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
     buf[len] = '\0';
     ESP_LOGI(BLE_TAG, "RX write (%d): %s", len, buf);
+    
+
+
+    // buf contains message, e.g. "N|SMS|Title|Body"
+    if (len >= 2 && buf[0] == 'N' && buf[1] == '|') {
+
+        // Make a working copy we can tokenize (buf is already mutable)
+        char *save = NULL;
+
+        char *tok = strtok_r(buf, "|", &save); // "N"
+        char *type = strtok_r(NULL, "|", &save); // "SMS"/"EMAIL"/"MSG"/etc
+        // title/body are optional for just icons
+        // char *title = strtok_r(NULL, "|", &save);
+        // char *body  = strtok_r(NULL, "",  &save);
+
+        notif_type_t t = notif_type_from_str(type);
+
+        // ✅ safe from BLE thread:
+        ui_notif_add_from_ble(t);
+    }
 
     if (s_on_rx) {
         s_on_rx(buf, len);
     }
-
     // Optional ACK back via notify on TX (only if phone subscribed)
     if (s_notify_enabled && s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_tx_val_handle) {
         const char *ack = "OK";

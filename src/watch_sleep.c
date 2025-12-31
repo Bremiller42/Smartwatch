@@ -62,6 +62,7 @@ static void screen_wake(void)
 
     if (clock_timer) lv_timer_resume(clock_timer);
     ui_show(UI_CLOCK);
+    ui_notif_refresh_async();
 
 }
 
