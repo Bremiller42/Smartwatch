@@ -13,6 +13,7 @@
 #include "watch_globals.h"
 #include "watch_ble.h"
 #include "watch_audio.h"
+#include "watch_icons/watch_icons.h"
 
 #include "display.h"
 #include "esp_bsp.h"
@@ -69,6 +70,13 @@ static void on_ble_toggle(lv_event_t *e);
 void ui_update_ble_status_async(void *arg);
 void ui_update_ble_icon_async(void *arg);
 
+// NEW (use this)
+static lv_obj_t *notif_icon_img[NG_MAX] = {0};
+
+// Badge labels (you already have these somewhere; keeping for completeness)
+static lv_obj_t *notif_badge_lbl[NG_MAX] = {0};
+static lv_obj_t *notif_badge_stroke[NG_MAX][4] = {0};
+
 /* ---------------- Misc UI state ---------------- */
 static lv_obj_t *timeout_sub_lbl = NULL;
 
@@ -78,14 +86,13 @@ static lv_obj_t *timeout_sub_lbl = NULL;
 #define NOTIF_GAP    10
 
 static lv_obj_t *notif_bar = NULL;                   // container (clock screen)
-static lv_obj_t *notif_slot[NOTIF_MAX] = {0};        // each icon slot
+static lv_obj_t *notif_slot[NG_MAX] = {0};        // each icon slot
 
 // FAKE STROKE: 4 black bold copies behind 1 white bold badge label
-static lv_obj_t *notif_badge_stroke[NOTIF_MAX][4] = {0};
-static lv_font_t *font_badge      = (lv_font_t *)&lv_font_montserrat_18;
 static lv_font_t *font_badge_bold = (lv_font_t *)&lv_font_montserrat_22; // or 20/22 if you want bigger
 
 static void notif_icons_refresh(void);
+static void notif_bar_relayout(void);
 
 static void ui_notif_refresh_cb(void *arg)
 {
@@ -99,6 +106,27 @@ void ui_notif_refresh_async(void)
     // safe to call from anywhere (ble task, sleep task, etc)
     lv_async_call(ui_notif_refresh_cb, NULL);
 }
+static const lv_img_dsc_t *icon_for_group(notif_type_t g)
+{
+    switch (g) {
+        case NG_YOUTUBE:   return &icon_youtube_brands_solid;
+        case NG_REDDIT:    return &icon_reddit_brands_solid;
+        case NG_DISCORD:   return &icon_discord_brands_solid;
+        case NG_AMAZON:    return &icon_amazon_brands_solid;
+
+        case NG_MESSENGER: return &icon_comments_regular;   // until you add a real chat bubble
+        case NG_META:      return &icon_meta_brands_solid;
+
+        case NG_WEATHER:   return &icon_cloud_sun_solid;
+        case NG_EMAIL:     return &icon_envelope_regular;
+        case NG_SMS:       return &icon_message_regular;    // swap to message icon when you add one
+        case NG_SYSTEM:    return &icon_desktop_solid;
+
+        case NG_APP:       return &icon_gear_solid;       // generic fallback icon
+        default:           return NULL;
+    }
+}
+
 
 /* ---------------- UI Helpers ---------------- */
 
@@ -279,7 +307,7 @@ static void notif_bar_set_hidden_if_empty(void)
     if (!notif_bar) return;
 
     uint32_t total = 0;
-    for (int i = 0; i < NOTIF_MAX; i++) total += g_notif_counts[i];
+    for (int i = 0; i < NG_MAX; i++) total += g_notif_counts[i];
 
     if (total == 0) lv_obj_add_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
     else            lv_obj_clear_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
@@ -289,7 +317,7 @@ static void notif_icons_refresh(void)
 {
     if (!notif_bar) return;
 
-    for (int i = 0; i < NOTIF_MAX; i++) {
+    for (int i = 0; i < NG_MAX; i++) {
         if (!notif_slot[i]) continue;
 
         uint16_t c = g_notif_counts[i];
@@ -311,13 +339,14 @@ static void notif_icons_refresh(void)
             if (notif_badge_stroke[i][k]) lv_label_set_text(notif_badge_stroke[i][k], b);
         }
     }
+    notif_bar_relayout();
 
     notif_bar_set_hidden_if_empty();
 }
 
 void ui_notif_add(notif_type_t t)
 {
-    if (t < 0 || t >= NOTIF_MAX) return;
+    if (t < 0 || t >= NG_MAX) return;
     if (g_notif_counts[t] < 999) g_notif_counts[t]++;
 
     g_notif_dirty = true;
@@ -328,7 +357,7 @@ void ui_notif_add(notif_type_t t)
 
 void ui_notif_clear_type(notif_type_t t)
 {
-    if (t < 0 || t >= NOTIF_MAX) return;
+    if (t < 0 || t >= NG_MAX) return;
     g_notif_counts[t] = 0;
 
     g_notif_dirty = true;
@@ -337,7 +366,7 @@ void ui_notif_clear_type(notif_type_t t)
 
 void ui_notif_clear_all(void)
 {
-    for (int i = 0; i < NOTIF_MAX; i++) g_notif_counts[i] = 0;
+    for (int i = 0; i < NG_MAX; i++) g_notif_counts[i] = 0;
 
     g_notif_dirty = true;
     ui_notif_refresh_async();
@@ -1018,6 +1047,20 @@ static void on_ble_toggle(lv_event_t *e)
     mark_user_activity();
 }
 
+static void notif_bar_relayout(void)
+{
+    int x = 0;
+
+    for (int i = 0; i < NG_MAX; i++) {
+        // Only lay out visible slots
+        if (lv_obj_has_flag(notif_slot[i], LV_OBJ_FLAG_HIDDEN)) continue;
+
+        lv_obj_align(notif_slot[i], LV_ALIGN_LEFT_MID, x, 0);
+        x += NOTIF_ICON_W + NOTIF_GAP;
+    }
+}
+
+
 /* ---------------- Screens ---------------- */
 
 static lv_obj_t *build_home_screen(void)
@@ -1097,7 +1140,7 @@ static lv_obj_t *build_clock_screen(void)
     lv_obj_set_style_border_width(notif_bar, 0, 0);
     lv_obj_clear_flag(notif_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    for (int i = 0; i < NOTIF_MAX; i++) {
+    for (int i = 0; i < NG_MAX; i++) {
         notif_slot[i] = lv_obj_create(notif_bar);
         lv_obj_set_size(notif_slot[i], NOTIF_ICON_W, NOTIF_ICON_H);
         lv_obj_set_style_radius(notif_slot[i], 8, 0);
@@ -1110,19 +1153,17 @@ static lv_obj_t *build_clock_screen(void)
         lv_obj_align(notif_slot[i], LV_ALIGN_LEFT_MID,
                     i * (NOTIF_ICON_W + NOTIF_GAP), 0);
 
-        // --- ICON (center) ---
-        notif_icon_lbl[i] = lv_label_create(notif_slot[i]);
-        lv_obj_set_style_text_color(notif_icon_lbl[i], lv_color_white(), 0);
-        lv_obj_set_style_text_font(notif_icon_lbl[i], &lv_font_montserrat_24, 0);
+        // --- ICON (center) --- (IMG icon)
+        notif_icon_img[i] = lv_img_create(notif_slot[i]);
 
-        switch (i) {
-            case NOTIF_SMS:   lv_label_set_text(notif_icon_lbl[i], LV_SYMBOL_BELL);      break;
-            case NOTIF_EMAIL: lv_label_set_text(notif_icon_lbl[i], LV_SYMBOL_ENVELOPE);  break;
-            case NOTIF_MSG:   lv_label_set_text(notif_icon_lbl[i], LV_SYMBOL_LIST);      break;
-            case NOTIF_APP:   lv_label_set_text(notif_icon_lbl[i], LV_SYMBOL_SETTINGS);  break;
-            default:          lv_label_set_text(notif_icon_lbl[i], "?");                 break;
-        }
-        lv_obj_center(notif_icon_lbl[i]);
+        const lv_img_dsc_t *src = icon_for_group((notif_type_t)i);
+        lv_img_set_src(notif_icon_img[i], src);
+
+        // These icons are ALPHA masks: recolor to white
+        lv_obj_set_style_img_recolor(notif_icon_img[i], lv_color_white(), 0);
+        lv_obj_set_style_img_recolor_opa(notif_icon_img[i], LV_OPA_COVER, 0);
+        lv_obj_center(notif_icon_img[i]);                 // simplest
+
 
         // -------------------------
         // BADGE (FAKE STROKE)

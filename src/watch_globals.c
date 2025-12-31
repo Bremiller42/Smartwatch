@@ -93,11 +93,11 @@ lv_obj_t *scr_settings = NULL;
 lv_obj_t *scr_blank    = NULL;
 
 
-uint16_t g_notif_counts[NOTIF_MAX] = {0};
+uint16_t g_notif_counts[NG_MAX] = {0};
 
 lv_obj_t *notif_icon_row = NULL;
-lv_obj_t *notif_icon_lbl[NOTIF_MAX] = {0};
-lv_obj_t *notif_badge_lbl[NOTIF_MAX] = {0};
-lv_obj_t *badge_outline[NOTIF_MAX] = {0};
+lv_obj_t *notif_icon_lbl[NG_MAX] = {0};
+lv_obj_t *notif_badge_lbl[NG_MAX] = {0};
+lv_obj_t *badge_outline[NG_MAX] = {0};
 
 volatile bool g_notif_dirty = false;

@@ -47,7 +47,8 @@ static const ble_uuid128_t UUID_CHR_TX = BLE_UUID128_INIT(
 static void ble_advertise(void);
 static void ble_stop_adv_only(void);
 static volatile bool s_ble_ui_dirty = false;
-
+static char   s_rx_accum[1024];
+static size_t s_rx_len = 0;
 /* ---------------- Small UI helpers ---------------- */
 static void ble_ui_mark_dirty(void)
 {
@@ -65,18 +66,39 @@ bool ble_ui_take_dirty(void)
     s_ble_ui_dirty = false;
     return true;
 }
-static notif_type_t notif_type_from_str(const char *s)
+static notif_type_t notif_group_from_pkg_and_type(const char *type, const char *pkg)
 {
-    if (!s) return NOTIF_APP;
-    if (strcmp(s, "SMS") == 0)   return NOTIF_SMS;
-    if (strcmp(s, "EMAIL") == 0) return NOTIF_EMAIL;
-    if (strcmp(s, "MSG") == 0)   return NOTIF_MSG;
-    if (strcmp(s, "TEST") == 0)  return NOTIF_APP; // your test type
-    return NOTIF_APP;
+    // 1) Package-based rules first (most specific)
+    if (pkg && *pkg) {
+        if (strstr(pkg, "com.google.android.youtube")) return NG_YOUTUBE;
+        if (strstr(pkg, "tv.twitch.android.app"))      return NG_APP;      // until you add Twitch icon
+        if (strstr(pkg, "com.reddit.frontpage"))       return NG_REDDIT;
+        if (strstr(pkg, "com.facebook.orca"))          return NG_MESSENGER;
+        if (strstr(pkg, "discord"))                    return NG_DISCORD;
+        if (strstr(pkg, "amazon"))                     return NG_AMAZON;
+
+        // Textra: treat as SMS group
+        if (strstr(pkg, "textra"))                     return NG_SMS;
+
+        // Pocket: you can give it its own later; for now put it under APP or SYSTEM/READ
+        if (strstr(pkg, "heypocket") || strstr(pkg, "getpocket")) return NG_APP;
+
+        // Google app often delivers weather cards
+        if (strstr(pkg, "googlequicksearchbox"))       return NG_WEATHER;
+    }
+
+    // 2) Type-based fallback (coarse)
+    if (type) {
+        if (!strcmp(type, "SMS"))     return NG_SMS;
+        if (!strcmp(type, "EMAIL"))   return NG_EMAIL;
+        if (!strcmp(type, "SYS"))     return NG_SYSTEM;
+        if (!strcmp(type, "WEATHER")) return NG_WEATHER;
+    }
+
+    // 3) Unknown -> generic app bucket
+    return NG_APP;
 }
 
-
-/* ---------------- RX write handler ---------------- */
 static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
@@ -88,41 +110,83 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    char buf[256];
-    int len = OS_MBUF_PKTLEN(ctxt->om);
-    if (len <= 0) return 0;
-    if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
+    char chunk[256];
+    int chunk_len = OS_MBUF_PKTLEN(ctxt->om);
+    if (chunk_len <= 0) return 0;
 
-    int rc = ble_hs_mbuf_to_flat(ctxt->om, buf, len, NULL);
+    if (chunk_len >= (int)sizeof(chunk)) chunk_len = (int)sizeof(chunk) - 1;
+
+    int rc = ble_hs_mbuf_to_flat(ctxt->om, chunk, chunk_len, NULL);
     if (rc != 0) return BLE_ATT_ERR_UNLIKELY;
 
-    buf[len] = '\0';
-    ESP_LOGI(BLE_TAG, "RX write (%d): %s", len, buf);
-    
+    chunk[chunk_len] = '\0';
+    ESP_LOGI(BLE_TAG, "RX chunk (%d): %s", chunk_len, chunk);
 
-
-    // buf contains message, e.g. "N|SMS|Title|Body"
-    if (len >= 2 && buf[0] == 'N' && buf[1] == '|') {
-
-        // Make a working copy we can tokenize (buf is already mutable)
-        char *save = NULL;
-
-        char *tok = strtok_r(buf, "|", &save); // "N"
-        char *type = strtok_r(NULL, "|", &save); // "SMS"/"EMAIL"/"MSG"/etc
-        // title/body are optional for just icons
-        // char *title = strtok_r(NULL, "|", &save);
-        // char *body  = strtok_r(NULL, "",  &save);
-
-        notif_type_t t = notif_type_from_str(type);
-
-        // ✅ safe from BLE thread:
-        ui_notif_add_from_ble(t);
+    /* If incoming data would overflow buffer, reset (fail-safe). */
+    if (s_rx_len + (size_t)chunk_len >= sizeof(s_rx_accum)) {
+        ESP_LOGW(BLE_TAG, "RX accum overflow; clearing buffer");
+        s_rx_len = 0;
+        s_rx_accum[0] = '\0';
     }
 
-    if (s_on_rx) {
-        s_on_rx(buf, len);
+    /* Append chunk into accumulator */
+    memcpy(s_rx_accum + s_rx_len, chunk, (size_t)chunk_len);
+    s_rx_len += (size_t)chunk_len;
+    s_rx_accum[s_rx_len] = '\0';
+
+    /* Process complete lines (newline-delimited frames) */
+    while (1) {
+        char *nl = strchr(s_rx_accum, '\n');
+        if (!nl) break;  // no full frame yet
+
+        *nl = '\0';      // terminate this frame
+        char *frame = s_rx_accum;
+
+        /* Trim optional '\r' (if Android ever sends CRLF) */
+        size_t flen = strlen(frame);
+        if (flen > 0 && frame[flen - 1] == '\r') frame[flen - 1] = '\0';
+
+        if (frame[0] != '\0') {
+            ESP_LOGI(BLE_TAG, "RX frame: %s", frame);
+
+            // Parse: "N|TYPE|PKG|Title|Body"
+            if (frame[0] == 'N' && frame[1] == '|') {
+
+                // Work buffer: same size as accumulator so tokenizing is safe
+                char work[1024];
+                size_t wlen = strlen(frame);
+                if (wlen >= sizeof(work)) wlen = sizeof(work) - 1;
+                memcpy(work, frame, wlen);
+                work[wlen] = '\0';
+
+                char *save = NULL;
+                (void)strtok_r(work, "|", &save);           // "N"
+                char *type  = strtok_r(NULL, "|", &save);   // "SMS"/"EMAIL"/"SYS"/"WEATHER"/etc
+                char *pkg   = strtok_r(NULL, "|", &save);   // "com.whatever.app"
+                char *title = strtok_r(NULL, "|", &save);   // optional
+                char *body  = strtok_r(NULL, "|", &save);   // optional
+
+                notif_type_t g = notif_group_from_pkg_and_type(type, pkg);
+                ui_notif_add_from_ble(g);
+
+                (void)title;
+                (void)body;
+            }
+
+            // Keep your raw RX callback if you still want it
+            if (s_on_rx) {
+                s_on_rx(frame, (int)strlen(frame));
+            }
+        }
+
+        /* Remove processed frame from accumulator */
+        size_t consumed = (size_t)(nl - s_rx_accum) + 1; // +1 for '\n'
+        memmove(s_rx_accum, s_rx_accum + consumed, s_rx_len - consumed);
+        s_rx_len -= consumed;
+        s_rx_accum[s_rx_len] = '\0';
     }
-    // Optional ACK back via notify on TX (only if phone subscribed)
+
+    /* Optional ACK back via notify on TX (only if phone subscribed) */
     if (s_notify_enabled && s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_tx_val_handle) {
         const char *ack = "OK";
         struct os_mbuf *om = ble_hs_mbuf_from_flat(ack, strlen(ack));
@@ -133,6 +197,7 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
     return 0;
 }
+
 
 /* ---------------- TX characteristic access (read) ---------------- */
 static int gatt_chr_tx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -182,6 +247,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
+
+                // Reset RX accumulator for a clean session
+                s_rx_len = 0;
+                s_rx_accum[0] = '\0';
+
                 s_conn_handle = event->connect.conn_handle;
                 g_ble_connected = true;
                 ESP_LOGI(BLE_TAG, "Connected (handle=%d)", s_conn_handle);
@@ -207,6 +277,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             s_notify_enabled = false;
             g_ble_connected = false;
             watch_audio_beep_async(1400, 80);
+            // Reset RX accumulator for a clean session
+            s_rx_len = 0;
+            s_rx_accum[0] = '\0';
 
             ble_ui_mark_dirty();
             ble_advertise();

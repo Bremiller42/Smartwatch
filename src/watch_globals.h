@@ -132,17 +132,23 @@ extern lv_obj_t *clock_notification_icon_box;
 #define LVGL_PORT_ROTATION_DEGREE (90)
 
 typedef enum {
-    NOTIF_SMS = 0,
-    NOTIF_EMAIL,
-    NOTIF_MSG,
-    NOTIF_APP,
-    NOTIF_MAX
+    NG_SMS = 0,       // textra / default sms apps -> one icon
+    NG_EMAIL,         // gmail/outlook/etc -> one icon
+
+    NG_MESSENGER,     // com.facebook.orca -> chat bubble / meta icon
+    NG_REDDIT,        // com.reddit.frontpage -> reddit icon
+    NG_YOUTUBE,       // com.google.android.youtube -> youtube icon
+    NG_DISCORD,       // discord -> discord icon
+    NG_AMAZON,        // amazon -> amazon icon
+    NG_META,          // facebook app if you want separate, otherwise merge with messenger/meta
+
+    NG_WEATHER,       // weather sources -> cloud/sun icon
+    NG_SYSTEM,        // sys -> desktop/clock/etc icon
+
+    NG_APP,           // unknown app fallback
+    NG_MAX
 } notif_type_t;
 
-extern uint16_t g_notif_counts[NOTIF_MAX];
-
-extern lv_obj_t *notif_icon_row;
-extern lv_obj_t *notif_icon_lbl[NOTIF_MAX];
-extern lv_obj_t *notif_badge_lbl[NOTIF_MAX];
+extern uint16_t g_notif_counts[NG_MAX];
 
 extern volatile bool g_notif_dirty;
