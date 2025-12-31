@@ -2,6 +2,7 @@
 // - Settings screen: NON-scrollable TabView (Display / Network / Time&Date)
 // - Tiles: rounded square tiles; switch-tiles are color-only (no visible switch)
 // - Notifications: uses ONLY the new notif_bar (no old notif_chip/notif_icon_row code)
+// - Badge "stroke": FAKE STROKE using 4 black bold clones behind 1 white bold main label
 // - Safe refresh path: all UI updates funnel through lv_async_call()
 
 #include "watch_ui.h"
@@ -72,13 +73,17 @@ void ui_update_ble_icon_async(void *arg);
 static lv_obj_t *timeout_sub_lbl = NULL;
 
 /* ---------------- Notifications (NEW BAR ONLY) ---------------- */
-#define NOTIF_ICON_W 28
-#define NOTIF_ICON_H 28
+#define NOTIF_ICON_W 40
+#define NOTIF_ICON_H 40
 #define NOTIF_GAP    10
 
 static lv_obj_t *notif_bar = NULL;                   // container (clock screen)
 static lv_obj_t *notif_slot[NOTIF_MAX] = {0};        // each icon slot
 
+// FAKE STROKE: 4 black bold copies behind 1 white bold badge label
+static lv_obj_t *notif_badge_stroke[NOTIF_MAX][4] = {0};
+static lv_font_t *font_badge      = (lv_font_t *)&lv_font_montserrat_18;
+static lv_font_t *font_badge_bold = (lv_font_t *)&lv_font_montserrat_22; // or 20/22 if you want bigger
 
 static void notif_icons_refresh(void);
 
@@ -301,7 +306,10 @@ static void notif_icons_refresh(void)
         if (c > 99) strcpy(b, "99+");
         else snprintf(b, sizeof(b), "%u", (unsigned)c);
 
-        lv_label_set_text(notif_badge_lbl[i], b);
+        if (notif_badge_lbl[i]) lv_label_set_text(notif_badge_lbl[i], b);
+        for (int k = 0; k < 4; k++) {
+            if (notif_badge_stroke[i][k]) lv_label_set_text(notif_badge_stroke[i][k], b);
+        }
     }
 
     notif_bar_set_hidden_if_empty();
@@ -1039,6 +1047,7 @@ static lv_obj_t *build_home_screen(void)
 
 static lv_obj_t *build_clock_screen(void)
 {
+
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -1098,37 +1107,58 @@ static lv_obj_t *build_clock_screen(void)
         lv_obj_set_style_border_color(notif_slot[i], lv_color_hex(0x505050), 0);
         lv_obj_clear_flag(notif_slot[i], LV_OBJ_FLAG_SCROLLABLE);
 
-        // manual X positioning
         lv_obj_align(notif_slot[i], LV_ALIGN_LEFT_MID,
-                     i * (NOTIF_ICON_W + NOTIF_GAP), 0);
+                    i * (NOTIF_ICON_W + NOTIF_GAP), 0);
 
-        // Icon label (centered)
+        // --- ICON (center) ---
         notif_icon_lbl[i] = lv_label_create(notif_slot[i]);
         lv_obj_set_style_text_color(notif_icon_lbl[i], lv_color_white(), 0);
-        lv_obj_set_style_text_font(notif_icon_lbl[i], &lv_font_montserrat_16, 0);
-        lv_label_set_text(notif_icon_lbl[i], "?");
+        lv_obj_set_style_text_font(notif_icon_lbl[i], &lv_font_montserrat_24, 0);
+
+        switch (i) {
+            case NOTIF_SMS:   lv_label_set_text(notif_icon_lbl[i], LV_SYMBOL_BELL);      break;
+            case NOTIF_EMAIL: lv_label_set_text(notif_icon_lbl[i], LV_SYMBOL_ENVELOPE);  break;
+            case NOTIF_MSG:   lv_label_set_text(notif_icon_lbl[i], LV_SYMBOL_LIST);      break;
+            case NOTIF_APP:   lv_label_set_text(notif_icon_lbl[i], LV_SYMBOL_SETTINGS);  break;
+            default:          lv_label_set_text(notif_icon_lbl[i], "?");                 break;
+        }
         lv_obj_center(notif_icon_lbl[i]);
 
-        // Badge label (top-right)
+        // -------------------------
+        // BADGE (FAKE STROKE)
+        // 4 black bold copies around 1 white bold label
+        // -------------------------
+        static const lv_coord_t dx[4] = { -1,  1,  0,  0 };
+        static const lv_coord_t dy[4] = {  0,  0, -1,  1 };
+
+        for (int k = 0; k < 4; k++) {
+            notif_badge_stroke[i][k] = lv_label_create(notif_slot[i]);
+            lv_obj_set_style_text_color(notif_badge_stroke[i][k], lv_color_black(), 0);
+            lv_obj_set_style_text_font(notif_badge_stroke[i][k], font_badge_bold, 0);
+            lv_label_set_text(notif_badge_stroke[i][k], "");
+            lv_obj_align(notif_badge_stroke[i][k],
+                         LV_ALIGN_BOTTOM_RIGHT,
+                         13 + dx[k],
+                         14 + dy[k]);
+        }
+
         notif_badge_lbl[i] = lv_label_create(notif_slot[i]);
         lv_obj_set_style_text_color(notif_badge_lbl[i], lv_color_white(), 0);
-        lv_obj_set_style_text_font(notif_badge_lbl[i], &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(notif_badge_lbl[i], font_badge_bold, 0);
         lv_label_set_text(notif_badge_lbl[i], "");
-        lv_obj_align(notif_badge_lbl[i], LV_ALIGN_TOP_RIGHT, 4, -6);
+        lv_obj_align(notif_badge_lbl[i], LV_ALIGN_BOTTOM_RIGHT, 13, 14);
 
+        // Ensure MAIN is top-most (stroke stays behind)
+        lv_obj_move_foreground(notif_badge_lbl[i]);
+
+        // Start hidden until count > 0
         lv_obj_add_flag(notif_slot[i], LV_OBJ_FLAG_HIDDEN);
     }
-
-    // Set icon glyphs ONCE (outside the loop)
-    lv_label_set_text(notif_icon_lbl[NOTIF_SMS],   "S");
-    lv_label_set_text(notif_icon_lbl[NOTIF_EMAIL], "E");
-    lv_label_set_text(notif_icon_lbl[NOTIF_MSG],   "M");
-    lv_label_set_text(notif_icon_lbl[NOTIF_APP],   "A");
 
     // Hide bar until there’s at least one notif
     lv_obj_add_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
 
-    // If counts already exist (e.g., you rebooted and restored), reflect them
+    // Reflect any existing counts
     notif_icons_refresh();
 
     return scr;
