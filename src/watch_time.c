@@ -1,7 +1,7 @@
 #include "watch_time.h"
 #include "watch_globals.h"
 #include "watch_ui.h"     // for ui_update_clock_async
-
+#include "watch_audio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sntp.h"
@@ -19,6 +19,8 @@ static void time_sync_notification_cb(struct timeval *tv)
     (void)tv;
     g_time_synced = true;
     ESP_LOGI(TM_TAG, "SNTP time synced");
+    watch_audio_beep(880, 70);
+    watch_audio_beep(1175, 90);
 
     time_save_last_known();
     lv_async_call(ui_update_clock_async, NULL);

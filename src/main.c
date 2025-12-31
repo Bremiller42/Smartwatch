@@ -4,7 +4,7 @@
 #include "esp_bsp.h"
 #include "lv_port.h"
 #include "watch_ble.h"
-
+#include "watch_audio.h"
 
 #include "watch_globals.h"
 #include "watch_settings.h"
@@ -12,6 +12,7 @@
 #include "watch_wifi.h"
 #include "watch_sleep.h"
 #include "watch_ui.h"
+
 
 #include <esp_log.h>
 #include <esp_flash.h>
@@ -57,11 +58,14 @@ static void init_logs_and_chipinfo(void)
     ESP_LOGI(MAIN_TAG, "Free PSRAM: %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
+
+
 void setup(void);
 
 #if !CONFIG_AUTOSTART_ARDUINO
 void app_main(void)
 {
+    
     setup();
 }
 #endif
@@ -71,11 +75,15 @@ void setup(void)
     esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set(MAIN_TAG, ESP_LOG_INFO);
 
+    watch_audio_init();
+    watch_audio_beep_async_init();
+
     logSection("Smartwatch start");
     init_logs_and_chipinfo();
 
     logSection("Initialize NVS settings");
     settings_nvs_init();
+
     settings_load_from_nvs();
 
     logSection("Initialize BLE");
@@ -111,6 +119,7 @@ void setup(void)
 
     logSection("Create UI");
     bsp_display_lock(0);
+    
     create_watch_ui();
     bsp_display_unlock();
 
@@ -121,6 +130,10 @@ void setup(void)
         ESP_LOGI(MAIN_TAG, "Auto WiFi enabled from NVS -> starting STA");
         wifi_start_sta(g_wifi_ssid, g_wifi_pass);
     }
+
+    watch_audio_beep(880, 80);   // A5, 80ms
+    watch_audio_beep(1320, 60);  // E6, 60ms
+    watch_audio_beep(1760, 90);  // A6, 90ms
 
     logSection("Smartwatch ready");
 }

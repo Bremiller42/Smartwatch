@@ -12,6 +12,7 @@
 #include "watch_sleep.h"
 #include "watch_globals.h"
 #include "watch_ble.h"
+#include "watch_audio.h"
 
 #include "display.h"
 #include "esp_bsp.h"
@@ -173,7 +174,6 @@ void clock_update_wifi_icon_now(void)
         lv_obj_set_style_text_opa(clock_wifi_icon, LV_OPA_COVER, 0);
         return;
     }
-
     // You can map RSSI to different icons later; for now keep 1 icon
     lv_label_set_text(clock_wifi_icon, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_opa(clock_wifi_icon, LV_OPA_COVER, 0);
@@ -977,6 +977,15 @@ static lv_obj_t *build_clock_screen(void)
     lv_obj_align_to(clock_ble_icon, clock_wifi_icon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
     lv_label_set_text(clock_ble_icon, LV_SYMBOL_BLUETOOTH);  // LVGL has this symbol
 
+    clock_notification_icon_box = lv_obj_create(scr);
+    lv_obj_set_size(clock_notification_icon_box, lv_pct(100), lv_pct(10));
+    lv_obj_align(clock_notification_icon_box, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_opa(clock_notification_icon_box, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(clock_notification_icon_box, 2, 0);
+    lv_obj_set_style_border_color(clock_notification_icon_box, lv_color_white(), 0);
+    lv_obj_clear_flag(clock_notification_icon_box, LV_OBJ_FLAG_SCROLLABLE);
+
+
     return scr;
 }
 
@@ -1178,4 +1187,7 @@ void ui_show(ui_screen_t s)
     }
 }
 
-void create_watch_ui(void) { ui_show(UI_CLOCK); }
+void create_watch_ui(void)
+{
+    ui_show(UI_CLOCK);
+}

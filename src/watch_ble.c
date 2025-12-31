@@ -1,7 +1,7 @@
 #include "watch_ble.h"
 #include "watch_globals.h"
 #include "watch_ui.h"
-
+#include "watch_audio.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -65,9 +65,6 @@ bool ble_ui_take_dirty(void)
     s_ble_ui_dirty = false;
     return true;
 }
-
-
-
 
 /* ---------------- RX write handler ---------------- */
 static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -159,6 +156,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                 s_conn_handle = event->connect.conn_handle;
                 g_ble_connected = true;
                 ESP_LOGI(BLE_TAG, "Connected (handle=%d)", s_conn_handle);
+                watch_audio_beep_async(1900, 100);
 
                 // Once connected, you are no longer advertising
                 ble_ui_mark_dirty();
@@ -179,6 +177,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
             s_notify_enabled = false;
             g_ble_connected = false;
+            watch_audio_beep_async(1400, 80);
 
             ble_ui_mark_dirty();
             ble_advertise();
@@ -316,7 +315,6 @@ static void host_task(void *param)
 esp_err_t ble_init(ble_rx_cb_t on_rx)
 {
     s_on_rx = on_rx;
-
     // Ensure NVS is ready (NimBLE may use it for keys/bonds)
     esp_err_t nvs = nvs_flash_init();
     if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -343,11 +341,12 @@ esp_err_t ble_init(ble_rx_cb_t on_rx)
     rc = ble_gatts_add_svcs(gatt_svcs);
     if (rc != 0) {
         ESP_LOGE(BLE_TAG, "ble_gatts_add_svcs rc=%d", rc);
-        ESP_LOGI(BLE_TAG, "Custom service registered, TX handle=%u",
-            (unsigned)s_tx_val_handle);
-
         return ESP_FAIL;
     }
+
+    ESP_LOGI(BLE_TAG, "Custom service registered, TX handle=%u",
+         (unsigned)s_tx_val_handle);
+    ESP_LOGI(BLE_TAG, "GATT services added. Device name=%s", ble_svc_gap_device_name());
 
     // Host sync callback starts advertising
     ble_hs_cfg.sync_cb = on_sync;
@@ -376,7 +375,6 @@ void ble_stop(void)
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     }
-
     s_notify_enabled = false;
     g_ble_connected = false;
 

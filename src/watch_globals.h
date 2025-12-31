@@ -127,6 +127,6 @@ extern lv_obj_t *scr_home;
 extern lv_obj_t *scr_clock;
 extern lv_obj_t *scr_settings;
 extern lv_obj_t *ble_status_lbl;   // optional
-
+extern lv_obj_t *clock_notification_icon_box;
 /* ---------------- Rotation ---------------- */
 #define LVGL_PORT_ROTATION_DEGREE (90)

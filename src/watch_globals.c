@@ -21,7 +21,7 @@ lv_obj_t *clock_wifi_icon = NULL;
 lv_obj_t *ip_lbl = NULL;
 
 lv_obj_t *clock_ble_icon = NULL;
-
+lv_obj_t *clock_notification_icon_box = NULL;
 
 /* Set-time dialog state */
 lv_obj_t *settime_modal = NULL;

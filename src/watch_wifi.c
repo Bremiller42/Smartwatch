@@ -3,6 +3,7 @@
 #include "watch_ui.h"
 #include "watch_time.h"
 #include "watch_settings.h"
+#include "watch_audio.h"
 
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -54,10 +55,14 @@ static void wifi_event_handler(void *arg,
         if (s_retry_num < WIFI_MAX_RETRY) {
             s_retry_num++;
             ESP_LOGW(WIFI_TAG, "WiFi disconnected, retry %d/%d", s_retry_num, WIFI_MAX_RETRY);
+            watch_audio_beep_async(990, 80);
+            watch_audio_beep_async(660, 80);
             esp_wifi_connect();
         } else {
             ESP_LOGE(WIFI_TAG, "WiFi failed to connect");
             xEventGroupSetBits(s_wifi_evgrp, WIFI_FAIL_BIT);
+            watch_audio_beep_async(990, 80);
+            watch_audio_beep_async(660, 80);
         }
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -65,6 +70,9 @@ static void wifi_event_handler(void *arg,
         s_retry_num = 0;
         g_wifi_connected = true;
         lv_async_call(ui_update_wifi_icon_async, NULL);
+
+        watch_audio_beep_async(660, 80);
+        watch_audio_beep_async(990, 80);
 
         ESP_LOGI(WIFI_TAG, "Connected to %s", g_wifi_ssid);
         ESP_LOGI(WIFI_TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
