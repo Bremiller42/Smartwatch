@@ -1,3 +1,5 @@
+// watch_ble.c (FULL, drop-in, minimally corrected)
+
 #include "watch_ble.h"
 #include "watch_globals.h"
 #include "watch_ui.h"
@@ -16,6 +18,7 @@
 #include "nimble/nimble_port_freertos.h"
 #include "nimble/ble.h"
 #include "host/ble_hs.h"
+
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -47,8 +50,82 @@ static const ble_uuid128_t UUID_CHR_TX = BLE_UUID128_INIT(
 static void ble_advertise(void);
 static void ble_stop_adv_only(void);
 static volatile bool s_ble_ui_dirty = false;
+
 static char   s_rx_accum[1024];
 static size_t s_rx_len = 0;
+
+/* ---------------- Notification state table ---------------- */
+#define NOTIF_MAX_ITEMS 30
+#define NOTIF_ID_MAX    256
+
+typedef struct {
+    bool used;
+    char id[NOTIF_ID_MAX];
+    notif_type_t group;
+} notif_item_t;
+
+static notif_item_t s_notifs[NOTIF_MAX_ITEMS];
+
+// Snapshot handling (your protocol N|S ... N|E)
+static bool s_notif_snapshot_mode = false;
+static bool s_notif_snapshot_dirty = false;
+
+static int notif_find(const char *id)
+{
+    for (int i = 0; i < NOTIF_MAX_ITEMS; i++) {
+        if (s_notifs[i].used && strncmp(s_notifs[i].id, id, NOTIF_ID_MAX) == 0) return i;
+    }
+    return -1;
+}
+
+static int notif_free_slot(void)
+{
+    for (int i = 0; i < NOTIF_MAX_ITEMS; i++) {
+        if (!s_notifs[i].used) return i;
+    }
+    return -1;
+}
+
+static void ui_hide_phone_batt_cb(void *arg)
+{
+    (void)arg;
+    if (!phone_batt_lbl) return;
+    lv_label_set_text(phone_batt_lbl, "");
+    lv_obj_add_flag(phone_batt_lbl, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Clear only battery UI/state (call on DISCONNECT if you want it blank when phone gone)
+static void phone_batt_clear_local(void)
+{
+    g_phone_batt_pct = -1;
+    g_phone_batt_charging = false;
+    lv_async_call(ui_hide_phone_batt_cb, NULL);
+}
+
+// IMPORTANT FIX:
+// Clearing notifications must NOT hide battery on connect.
+static void notif_clear_all_local(void)
+{
+    memset(s_notifs, 0, sizeof(s_notifs));
+    for (int i = 0; i < NG_MAX; i++) g_notif_counts[i] = 0;
+
+    // DO NOT touch phone battery here.
+    // Battery is its own thing, not part of notification snapshot.
+}
+
+static void notif_recalc_counts(void)
+{
+    for (int i = 0; i < NG_MAX; i++) g_notif_counts[i] = 0;
+
+    for (int i = 0; i < NOTIF_MAX_ITEMS; i++) {
+        if (!s_notifs[i].used) continue;
+        notif_type_t g = s_notifs[i].group;
+        if (g >= 0 && g < NG_MAX && g_notif_counts[g] < 999) {
+            g_notif_counts[g]++;
+        }
+    }
+}
+
 /* ---------------- Small UI helpers ---------------- */
 static void ble_ui_mark_dirty(void)
 {
@@ -66,6 +143,7 @@ bool ble_ui_take_dirty(void)
     s_ble_ui_dirty = false;
     return true;
 }
+
 static notif_type_t notif_group_from_pkg_and_type(const char *type, const char *pkg)
 {
     // 1) Package-based rules first (most specific)
@@ -78,9 +156,9 @@ static notif_type_t notif_group_from_pkg_and_type(const char *type, const char *
         if (strstr(pkg, "amazon"))                     return NG_AMAZON;
 
         // Textra: treat as SMS group
-        if (strstr(pkg, "textra"))                     return NG_SMS;
+        if (strstr(pkg, "com.textra"))                 return NG_SMS;
 
-        // Pocket: you can give it its own later; for now put it under APP or SYSTEM/READ
+        // Pocket: you can give it its own later; for now put it under APP
         if (strstr(pkg, "heypocket") || strstr(pkg, "getpocket")) return NG_APP;
 
         // Google app often delivers weather cards
@@ -97,6 +175,32 @@ static notif_type_t notif_group_from_pkg_and_type(const char *type, const char *
 
     // 3) Unknown -> generic app bucket
     return NG_APP;
+}
+
+// Parse a battery frame: "B|P|<pct>|C|<0|1>"
+static bool parse_batt_frame(const char *frame)
+{
+    if (!frame) return false;
+    if (!(frame[0] == 'B' && frame[1] == '|')) return false;
+
+    char work[64];
+    strncpy(work, frame, sizeof(work) - 1);
+    work[sizeof(work) - 1] = '\0';
+
+    char *save = NULL;
+    (void)strtok_r(work, "|", &save);       // "B"
+    char *p_tag = strtok_r(NULL, "|", &save); // "P"
+    char *p_val = strtok_r(NULL, "|", &save); // pct
+    char *c_tag = strtok_r(NULL, "|", &save); // "C"
+    char *c_val = strtok_r(NULL, "|", &save); // charging
+
+    if (p_tag && p_val && c_tag && c_val &&
+        !strcmp(p_tag, "P") && !strcmp(c_tag, "C")) {
+        ui_set_phone_batt(atoi(p_val), atoi(c_val) != 0);
+        return true;
+    }
+
+    return false;
 }
 
 static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -129,30 +233,51 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         s_rx_accum[0] = '\0';
     }
 
-    /* Append chunk into accumulator */
+    /* Append chunk into accumulator (FIX: append BEFORE any fallback parsing) */
     memcpy(s_rx_accum + s_rx_len, chunk, (size_t)chunk_len);
     s_rx_len += (size_t)chunk_len;
     s_rx_accum[s_rx_len] = '\0';
 
+    // -------- Battery fallback: allow B frames even if '\n' hasn't arrived yet --------
+    // If buffer begins with B| and has enough separators, parse immediately and clear.
+    if (s_rx_len >= 2 && s_rx_accum[0] == 'B' && s_rx_accum[1] == '|') {
+        int pipes = 0;
+        for (size_t i = 0; i < s_rx_len; i++) {
+            if (s_rx_accum[i] == '|') pipes++;
+        }
+        if (pipes >= 5) {
+            if (parse_batt_frame(s_rx_accum)) {
+                s_rx_len = 0;
+                s_rx_accum[0] = '\0';
+            }
+        }
+    }
+
     /* Process complete lines (newline-delimited frames) */
     while (1) {
         char *nl = strchr(s_rx_accum, '\n');
-        if (!nl) break;  // no full frame yet
+        if (!nl) break;
 
-        *nl = '\0';      // terminate this frame
+        *nl = '\0';             // terminate this frame
         char *frame = s_rx_accum;
 
-        /* Trim optional '\r' (if Android ever sends CRLF) */
+        // Trim optional '\r'
         size_t flen = strlen(frame);
         if (flen > 0 && frame[flen - 1] == '\r') frame[flen - 1] = '\0';
 
         if (frame[0] != '\0') {
             ESP_LOGI(BLE_TAG, "RX frame: %s", frame);
 
-            // Parse: "N|TYPE|PKG|Title|Body"
-            if (frame[0] == 'N' && frame[1] == '|') {
+            // Battery frame
+            if (frame[0] == 'B' && frame[1] == '|') {
+                (void)parse_batt_frame(frame);
 
-                // Work buffer: same size as accumulator so tokenizing is safe
+                // Optional pass-through callback
+                if (s_on_rx) s_on_rx(frame, (int)strlen(frame));
+            }
+            // Notification frames
+            else if (frame[0] == 'N' && frame[1] == '|') {
+
                 char work[1024];
                 size_t wlen = strlen(frame);
                 if (wlen >= sizeof(work)) wlen = sizeof(work) - 1;
@@ -160,22 +285,101 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                 work[wlen] = '\0';
 
                 char *save = NULL;
-                (void)strtok_r(work, "|", &save);           // "N"
-                char *type  = strtok_r(NULL, "|", &save);   // "SMS"/"EMAIL"/"SYS"/"WEATHER"/etc
-                char *pkg   = strtok_r(NULL, "|", &save);   // "com.whatever.app"
-                char *title = strtok_r(NULL, "|", &save);   // optional
-                char *body  = strtok_r(NULL, "|", &save);   // optional
+                (void)strtok_r(work, "|", &save);      // "N"
+                char *cmd = strtok_r(NULL, "|", &save); // "U"/"D"/"S"/"E" or old TYPE
 
-                notif_type_t g = notif_group_from_pkg_and_type(type, pkg);
-                ui_notif_add_from_ble(g);
+                if (cmd) {
+                    // Snapshot start: N|S
+                    if (!strcmp(cmd, "S")) {
+                        ESP_LOGI(BLE_TAG, "Notif snapshot START");
 
-                (void)title;
-                (void)body;
+                        notif_clear_all_local();       // clear notif state ONLY
+                        s_notif_snapshot_mode = true;
+                        s_notif_snapshot_dirty = true; // will refresh once at end
+                    }
+                    // Snapshot end: N|E
+                    else if (!strcmp(cmd, "E")) {
+                        ESP_LOGI(BLE_TAG, "Notif snapshot END");
+
+                        s_notif_snapshot_mode = false;
+
+                        notif_recalc_counts();
+                        ui_notif_refresh_async();
+                    }
+                    // Delete: N|D|id
+                    else if (!strcmp(cmd, "D")) {
+                        char *id = strtok_r(NULL, "|", &save);
+                        if (id && *id) {
+                            int idx = notif_find(id);
+                            if (idx >= 0) {
+                                s_notifs[idx].used = false;
+                                ESP_LOGI(BLE_TAG, "Notif delete id=%s", id);
+                            } else {
+                                ESP_LOGI(BLE_TAG, "Notif delete id=%s (not found)", id);
+                            }
+
+                            notif_recalc_counts();
+                            if (s_notif_snapshot_mode) {
+                                s_notif_snapshot_dirty = true;
+                            } else {
+                                ui_notif_refresh_async();
+                            }
+                        }
+                    }
+                    // Upsert: N|U|id|type|pkg|title|body
+                    else if (!strcmp(cmd, "U")) {
+                        char *id    = strtok_r(NULL, "|", &save);
+                        char *type  = strtok_r(NULL, "|", &save);
+                        char *pkg   = strtok_r(NULL, "|", &save);
+                        char *title = strtok_r(NULL, "|", &save);
+                        char *body  = strtok_r(NULL, "|", &save);
+                        (void)title; (void)body;
+
+                        if (id && *id && type && *type) {
+                            notif_type_t g = notif_group_from_pkg_and_type(type, pkg);
+
+                            int idx = notif_find(id);
+                            if (idx < 0) idx = notif_free_slot();
+
+                            if (idx >= 0) {
+                                s_notifs[idx].used  = true;
+                                s_notifs[idx].group = g;
+                                strncpy(s_notifs[idx].id, id, NOTIF_ID_MAX - 1);
+                                s_notifs[idx].id[NOTIF_ID_MAX - 1] = '\0';
+
+                                ESP_LOGI(BLE_TAG, "Notif upsert id=%s group=%d",
+                                         s_notifs[idx].id, (int)g);
+                            } else {
+                                ESP_LOGW(BLE_TAG, "Notif table full; dropping id=%s", id);
+                            }
+
+                            notif_recalc_counts();
+                            if (s_notif_snapshot_mode) {
+                                s_notif_snapshot_dirty = true;
+                            } else {
+                                ui_notif_refresh_async();
+                            }
+                        }
+                    }
+                    // Backward compat: old format N|TYPE|PKG|Title|Body
+                    else {
+                        char *type  = cmd;
+                        char *pkg   = strtok_r(NULL, "|", &save);
+                        char *title = strtok_r(NULL, "|", &save);
+                        char *body  = strtok_r(NULL, "|", &save);
+                        (void)title; (void)body;
+
+                        notif_type_t g = notif_group_from_pkg_and_type(type, pkg);
+                        ui_notif_add_from_ble(g);
+                    }
+                }
+
+                // Optional pass-through callback
+                if (s_on_rx) s_on_rx(frame, (int)strlen(frame));
             }
-
-            // Keep your raw RX callback if you still want it
-            if (s_on_rx) {
-                s_on_rx(frame, (int)strlen(frame));
+            // Anything else
+            else {
+                if (s_on_rx) s_on_rx(frame, (int)strlen(frame));
             }
         }
 
@@ -197,7 +401,6 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
     return 0;
 }
-
 
 /* ---------------- TX characteristic access (read) ---------------- */
 static int gatt_chr_tx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -228,10 +431,10 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
                 .flags     = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
             },
             {
-                .uuid      = &UUID_CHR_TX.u,
-                .access_cb = gatt_chr_tx_access_cb,
+                .uuid       = &UUID_CHR_TX.u,
+                .access_cb  = gatt_chr_tx_access_cb,
                 .val_handle = &s_tx_val_handle,
-                .flags     = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ,
+                .flags      = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ,
             },
             { 0 }
         },
@@ -254,10 +457,17 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
                 s_conn_handle = event->connect.conn_handle;
                 g_ble_connected = true;
+
+                // IMPORTANT FIX:
+                // Do NOT hide/clear battery on connect.
+                // Only clear notification state.
+                notif_clear_all_local();
+                s_notif_snapshot_mode = false;
+                s_notif_snapshot_dirty = false;
+
                 ESP_LOGI(BLE_TAG, "Connected (handle=%d)", s_conn_handle);
                 watch_audio_beep_async(1900, 100);
 
-                // Once connected, you are no longer advertising
                 ble_ui_mark_dirty();
 
             } else {
@@ -276,7 +486,15 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
             s_notify_enabled = false;
             g_ble_connected = false;
+
+            // Clear notif state + battery when phone is gone
+            notif_clear_all_local();
+            phone_batt_clear_local();
+            s_notif_snapshot_mode = false;
+            s_notif_snapshot_dirty = false;
+
             watch_audio_beep_async(1400, 80);
+
             // Reset RX accumulator for a clean session
             s_rx_len = 0;
             s_rx_accum[0] = '\0';
@@ -306,11 +524,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 /* ---------------- Advertising ---------------- */
 static void ble_stop_adv_only(void)
 {
-    // Safe to call even if not advertising
-    int rc = ble_gap_adv_stop();
-    if (rc != 0) {
-        // NimBLE prints its own "stop advertising" logs; keep ours quiet unless debugging
-    }
+    (void)ble_gap_adv_stop();
 }
 
 static void ble_advertise(void)
@@ -323,13 +537,8 @@ static void ble_advertise(void)
     memset(&adv_fields, 0, sizeof(adv_fields));
     memset(&rsp_fields, 0, sizeof(rsp_fields));
 
-    // Stop current advertising before re-start
     ble_stop_adv_only();
 
-    /* --- ADV packet (<= 31 bytes) ---
-       Keep it small so Android sees it reliably.
-       Put NAME here.
-    */
     adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
     const char *name = ble_svc_gap_device_name();
@@ -337,7 +546,6 @@ static void ble_advertise(void)
     adv_fields.name_len = strlen(name);
     adv_fields.name_is_complete = 1;
 
-    // Optional: include TX power (helps some scanners show data)
     adv_fields.tx_pwr_lvl_is_present = 1;
     adv_fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
 
@@ -347,13 +555,9 @@ static void ble_advertise(void)
         return;
     }
 
-    /* --- Scan Response packet (extra 31 bytes) ---
-       Put 128-bit UUID here so we don't blow the ADV size.
-    */
     rsp_fields.uuids128 = (const ble_uuid128_t *)&UUID_SVC_NOTIF;
     rsp_fields.num_uuids128 = 1;
     rsp_fields.uuids128_is_complete = 1;
-
 
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
     if (rc != 0) {
@@ -361,18 +565,9 @@ static void ble_advertise(void)
         return;
     }
 
-    // Connectable + discoverable
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    // Ensure SCANNABLE so scan response is actually used.
-    // NOTE: Some NimBLE versions may not have this field.
-    // If you get a compile error: remove this line and tell me the error text.
-#ifdef __GNUC__
-    // Try to set scannable if present in struct
-    // (No portable reflection in C; this is here so you remember why.)
-#endif
-    // Make it "snappy" for Android scan lists
     adv_params.itvl_min = 0x0030; // 30ms
     adv_params.itvl_max = 0x0060; // 60ms
 
@@ -383,16 +578,13 @@ static void ble_advertise(void)
                  rc, (unsigned)s_own_addr_type);
     } else {
         ESP_LOGI(BLE_TAG, "Advertising started (addr_type=%u)", (unsigned)s_own_addr_type);
-        // Not connected, but BLE is ON -> should show "Advertising"
         ble_ui_mark_dirty();
-
     }
 }
 
 /* ---------------- Host sync ---------------- */
 static void on_sync(void)
 {
-    // Prefer random static address for ESP32 reliability
     int rc = ble_hs_id_infer_auto(1, &s_own_addr_type);
     if (rc != 0) {
         ESP_LOGW(BLE_TAG, "ble_hs_id_infer_auto(1) rc=%d; fallback infer_auto(0)", rc);
@@ -409,7 +601,7 @@ static void on_sync(void)
 static void host_task(void *param)
 {
     (void)param;
-    nimble_port_run();             // runs host; returns on nimble_port_stop()
+    nimble_port_run();
     nimble_port_freertos_deinit();
 }
 
@@ -417,7 +609,7 @@ static void host_task(void *param)
 esp_err_t ble_init(ble_rx_cb_t on_rx)
 {
     s_on_rx = on_rx;
-    // Ensure NVS is ready (NimBLE may use it for keys/bonds)
+
     esp_err_t nvs = nvs_flash_init();
     if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -431,7 +623,6 @@ esp_err_t ble_init(ble_rx_cb_t on_rx)
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
-    // Name shown to Android scanners
     ble_svc_gap_device_name_set("NoesisWatch");
 
     int rc = ble_gatts_count_cfg(gatt_svcs);
@@ -446,11 +637,9 @@ esp_err_t ble_init(ble_rx_cb_t on_rx)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(BLE_TAG, "Custom service registered, TX handle=%u",
-         (unsigned)s_tx_val_handle);
+    ESP_LOGI(BLE_TAG, "Custom service registered, TX handle=%u", (unsigned)s_tx_val_handle);
     ESP_LOGI(BLE_TAG, "GATT services added. Device name=%s", ble_svc_gap_device_name());
 
-    // Host sync callback starts advertising
     ble_hs_cfg.sync_cb = on_sync;
 
     nimble_port_freertos_init(host_task);
@@ -461,7 +650,6 @@ esp_err_t ble_init(ble_rx_cb_t on_rx)
 
 void ble_start(void)
 {
-    // If not connected, ensure advertising is on
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
         ble_advertise();
     }
@@ -469,14 +657,13 @@ void ble_start(void)
 
 void ble_stop(void)
 {
-    // Stop advertising
     ble_stop_adv_only();
 
-    // Disconnect if connected
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     }
+
     s_notify_enabled = false;
     g_ble_connected = false;
 

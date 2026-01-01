@@ -75,7 +75,8 @@ extern bool s_handlers_registered;
 extern esp_event_handler_instance_t s_wifi_any_id_inst;
 extern esp_event_handler_instance_t s_got_ip_inst;
 
-
+extern lv_obj_t *phone_batt_lbl;
+extern lv_obj_t *phone_icon_lbl;
 /* -----------------BLE----------------- */
 extern bool g_ble_on;
 extern bool g_ble_connected;
@@ -152,3 +153,5 @@ typedef enum {
 extern uint16_t g_notif_counts[NG_MAX];
 
 extern volatile bool g_notif_dirty;
+extern lv_obj_t *phone_batt_lbl;
+

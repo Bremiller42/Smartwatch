@@ -1,10 +1,3 @@
-// watch_ui.c (single-file, complete, cleaned version)
-// - Settings screen: NON-scrollable TabView (Display / Network / Time&Date)
-// - Tiles: rounded square tiles; switch-tiles are color-only (no visible switch)
-// - Notifications: uses ONLY the new notif_bar (no old notif_chip/notif_icon_row code)
-// - Badge "stroke": FAKE STROKE using 4 black bold clones behind 1 white bold main label
-// - Safe refresh path: all UI updates funnel through lv_async_call()
-
 #include "watch_ui.h"
 #include "watch_wifi.h"
 #include "watch_settings.h"
@@ -84,6 +77,10 @@ static lv_obj_t *timeout_sub_lbl = NULL;
 #define NOTIF_ICON_W 40
 #define NOTIF_ICON_H 40
 #define NOTIF_GAP    10
+#define NOTIF_COLS 6   // icons per row (tune: 5 or 6 usually)
+#define NOTIF_ROWS 1   // rows of icons (tune: 1 or 2)
+#define NOTIF_BAR_TOP_Y 120
+#define NOTIF_BAR_W_PCT 92
 
 static lv_obj_t *notif_bar = NULL;                   // container (clock screen)
 static lv_obj_t *notif_slot[NG_MAX] = {0};        // each icon slot
@@ -93,6 +90,8 @@ static lv_font_t *font_badge_bold = (lv_font_t *)&lv_font_montserrat_22; // or 2
 
 static void notif_icons_refresh(void);
 static void notif_bar_relayout(void);
+int  g_phone_batt_pct = -1;
+bool g_phone_batt_charging = false;
 
 static void ui_notif_refresh_cb(void *arg)
 {
@@ -114,15 +113,15 @@ static const lv_img_dsc_t *icon_for_group(notif_type_t g)
         case NG_DISCORD:   return &icon_discord_brands_solid;
         case NG_AMAZON:    return &icon_amazon_brands_solid;
 
-        case NG_MESSENGER: return &icon_comments_regular;   // until you add a real chat bubble
+        case NG_MESSENGER: return &icon_comments_regular;  
         case NG_META:      return &icon_meta_brands_solid;
 
         case NG_WEATHER:   return &icon_cloud_sun_solid;
         case NG_EMAIL:     return &icon_envelope_regular;
-        case NG_SMS:       return &icon_message_regular;    // swap to message icon when you add one
+        case NG_SMS:       return &icon_message_regular; 
         case NG_SYSTEM:    return &icon_desktop_solid;
 
-        case NG_APP:       return &icon_gear_solid;       // generic fallback icon
+        case NG_APP:       return &icon_gear_solid;     
         default:           return NULL;
     }
 }
@@ -300,22 +299,49 @@ static void clock_timer_cb(lv_timer_t *t)
     }
 }
 
-/* ---------------- Notifications Bar ---------------- */
-
-static void notif_bar_set_hidden_if_empty(void)
+static void ui_update_phone_batt_cb(void *arg)
 {
-    if (!notif_bar) return;
+    (void)arg;
 
-    uint32_t total = 0;
-    for (int i = 0; i < NG_MAX; i++) total += g_notif_counts[i];
+    // UI safety: only update if label exists (clock screen built)
+    if (!phone_batt_lbl) return;
 
-    if (total == 0) lv_obj_add_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
-    else            lv_obj_clear_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
+    // invalid -> hide
+    if (g_phone_batt_pct < 0 || g_phone_batt_pct > 100) {
+        lv_label_set_text(phone_batt_lbl, "");
+        lv_obj_add_flag(phone_batt_lbl, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    // valid -> show
+    lv_obj_clear_flag(phone_batt_lbl, LV_OBJ_FLAG_HIDDEN);
+    static char buf[32];
+
+    // Pick whatever icon you want. LVGL has these built-ins:
+    // LV_SYMBOL_BATTERY_FULL, LV_SYMBOL_CHARGE, etc.
+    const char *icon = g_phone_batt_charging ? LV_SYMBOL_CHARGE : LV_SYMBOL_BATTERY_FULL;
+    snprintf(buf, sizeof(buf), "%s %d%%", icon, g_phone_batt_pct);
+    lv_label_set_text(phone_batt_lbl, buf);
+    ESP_LOGI(UI_TAG, "Phone Batt Updated %d%%", g_phone_batt_pct);
 }
+
+void ui_set_phone_batt(int pct, bool charging)
+{
+    g_phone_batt_pct = pct;
+    g_phone_batt_charging = charging;
+    lv_async_call(ui_update_phone_batt_cb, NULL);
+ESP_LOGI(UI_TAG, "Phone Batt Set %d%% charging=%d", g_phone_batt_pct, (int)g_phone_batt_charging);
+
+}
+
+
+/* ---------------- Notifications Bar ---------------- */
 
 static void notif_icons_refresh(void)
 {
     if (!notif_bar) return;
+
+    int visible_count = 0;
 
     for (int i = 0; i < NG_MAX; i++) {
         if (!notif_slot[i]) continue;
@@ -327,9 +353,9 @@ static void notif_icons_refresh(void)
             continue;
         }
 
+        visible_count++;
         lv_obj_clear_flag(notif_slot[i], LV_OBJ_FLAG_HIDDEN);
 
-        // Badge: 1..99+
         char b[8];
         if (c > 99) strcpy(b, "99+");
         else snprintf(b, sizeof(b), "%u", (unsigned)c);
@@ -339,10 +365,16 @@ static void notif_icons_refresh(void)
             if (notif_badge_stroke[i][k]) lv_label_set_text(notif_badge_stroke[i][k], b);
         }
     }
-    notif_bar_relayout();
 
-    notif_bar_set_hidden_if_empty();
+    if (visible_count == 0) {
+        lv_obj_add_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    lv_obj_clear_flag(notif_bar, LV_OBJ_FLAG_HIDDEN);
+    notif_bar_relayout();
 }
+
 
 void ui_notif_add(notif_type_t t)
 {
@@ -1049,14 +1081,43 @@ static void on_ble_toggle(lv_event_t *e)
 
 static void notif_bar_relayout(void)
 {
-    int x = 0;
+    if (!notif_bar) return;
 
+    int visible_count = 0;
     for (int i = 0; i < NG_MAX; i++) {
-        // Only lay out visible slots
+        if (!notif_slot[i]) continue;
+        if (lv_obj_has_flag(notif_slot[i], LV_OBJ_FLAG_HIDDEN)) continue;
+        visible_count++;
+    }
+
+    if (visible_count == 0) {
+        lv_obj_set_height(notif_bar, 0);
+        // keep it aligned anyway (safe)
+        lv_obj_align(notif_bar, LV_ALIGN_TOP_MID, 0, NOTIF_BAR_TOP_Y);
+        return;
+    }
+
+    int rows = (visible_count + NOTIF_COLS - 1) / NOTIF_COLS;
+    lv_coord_t h = (rows * NOTIF_ICON_H) + ((rows - 1) * NOTIF_GAP);
+
+    lv_obj_set_height(notif_bar, h);
+
+    // IMPORTANT: re-anchor after resizing so it doesn't drift / clip weirdly
+    lv_obj_align(notif_bar, LV_ALIGN_TOP_MID, 0, NOTIF_BAR_TOP_Y);
+
+    int visible_idx = 0;
+    for (int i = 0; i < NG_MAX; i++) {
+        if (!notif_slot[i]) continue;
         if (lv_obj_has_flag(notif_slot[i], LV_OBJ_FLAG_HIDDEN)) continue;
 
-        lv_obj_align(notif_slot[i], LV_ALIGN_LEFT_MID, x, 0);
-        x += NOTIF_ICON_W + NOTIF_GAP;
+        int row = visible_idx / NOTIF_COLS;
+        int col = visible_idx % NOTIF_COLS;
+
+        int x = col * (NOTIF_ICON_W + NOTIF_GAP);
+        int y = row * (NOTIF_ICON_H + NOTIF_GAP);
+
+        lv_obj_set_pos(notif_slot[i], x, y); // use set_pos inside parent
+        visible_idx++;
     }
 }
 
@@ -1095,7 +1156,10 @@ static lv_obj_t *build_clock_screen(void)
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_add_event_cb(scr, activity_event_cb, LV_EVENT_ALL, NULL);
-
+    lv_obj_set_style_clip_corner(scr, false, 0);
+    lv_obj_set_style_radius(scr, 0, 0);        // optional, but removes rounded clip edge effects
+    lv_obj_set_style_pad_all(scr, 0, 0);       // optional
+    
     clock_time_lbl = lv_label_create(scr);
     lv_obj_set_style_text_font(clock_time_lbl, &orbitron_72, 0);
     lv_obj_set_style_text_color(clock_time_lbl, lv_color_white(), 0);
@@ -1113,8 +1177,22 @@ static lv_obj_t *build_clock_screen(void)
 
     clock_ble_icon = lv_label_create(scr);
     lv_obj_set_style_text_color(clock_ble_icon, lv_color_white(), 0);
-    lv_obj_align_to(clock_ble_icon, clock_wifi_icon, LV_ALIGN_OUT_LEFT_MID, -10, 0);
+    lv_obj_align_to(clock_ble_icon, clock_wifi_icon, LV_ALIGN_OUT_LEFT_MID, -5, 0);
     lv_label_set_text(clock_ble_icon, LV_SYMBOL_BLUETOOTH);
+
+    phone_batt_lbl = lv_label_create(scr);
+    lv_label_set_text(phone_batt_lbl, "");   // hidden until data arrives
+
+    lv_obj_set_style_text_color(phone_batt_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(phone_batt_lbl, &lv_font_montserrat_16, 0);
+
+    // Keep the RIGHT edge fixed so % never shifts when icon width changes
+    lv_obj_set_width(phone_batt_lbl, 90);                       // tweak if needed (e.g., 80–110)
+    lv_obj_set_style_text_align(phone_batt_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+
+    // Anchor the label's RIGHT edge at the same spot you had before
+    lv_obj_align_to(phone_batt_lbl, scr, LV_ALIGN_RIGHT_MID, -10, -45);
+
 
     clock_update_label_now();
     clock_update_wifi_icon_now();
@@ -1123,22 +1201,30 @@ static lv_obj_t *build_clock_screen(void)
     if (clock_timer == NULL) {
         clock_timer = lv_timer_create(clock_timer_cb, 1000, NULL);
     }
-
-    lv_obj_t *menu = lv_btn_create(scr);
-    lv_obj_set_size(menu, 90, 50);
-    lv_obj_set_style_bg_color(menu, lv_color_black(), 0);
-    lv_obj_align(menu, LV_ALIGN_BOTTOM_LEFT, 12, -12);
-    lv_obj_add_event_cb(menu, on_back_to_home, LV_EVENT_CLICKED, NULL);
-    lv_label_set_text(lv_label_create(menu), LV_SYMBOL_HOME);
-    lv_obj_center(lv_obj_get_child(menu, 0));
-
-    // --- Notification icon bar (fixed layout) ---
+    
     notif_bar = lv_obj_create(scr);
-    lv_obj_set_size(notif_bar, lv_pct(92), NOTIF_ICON_H);
-    lv_obj_align(notif_bar, LV_ALIGN_TOP_MID, 0, 120);
+    lv_obj_set_width(notif_bar, lv_pct(92));
+    lv_obj_set_height(notif_bar, 0);                 // dynamic height
     lv_obj_set_style_bg_opa(notif_bar, LV_OPA_0, 0);
     lv_obj_set_style_border_width(notif_bar, 0, 0);
     lv_obj_clear_flag(notif_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(notif_bar, LV_ALIGN_TOP_MID, 0, NOTIF_BAR_TOP_Y);
+    lv_obj_set_style_clip_corner(notif_bar, false, 0);
+    lv_obj_set_style_radius(notif_bar, 0, 0);        // optional, but removes rounded clip edge effects
+    lv_obj_set_style_pad_all(notif_bar, 0, 0);       // optional
+
+    // // --- fixed slot 0: BACK button ---
+    // lv_obj_t *notif_clr = lv_btn_create(scr);
+    // lv_obj_set_size(notif_clr, 30, 30);
+    // lv_obj_set_style_bg_color(notif_clr, lv_color_black(), 0);
+    // lv_obj_align(notif_clr, LV_ALIGN_LEFT_MID, 0, -55);
+    // lv_obj_add_event_cb(notif_clr, ui_notif_clear_all_cb, LV_EVENT_CLICKED, NULL);
+
+    // // icon
+    // lv_obj_t *clr_icon = lv_label_create(notif_clr);
+    // lv_obj_set_style_text_color(clr_icon, lv_color_white(), 0);
+    // lv_label_set_text(clr_icon, LV_SYMBOL_CLOSE);   // or LV_SYMBOL_LEFT
+    // lv_obj_center(clr_icon);
 
     for (int i = 0; i < NG_MAX; i++) {
         notif_slot[i] = lv_obj_create(notif_bar);
@@ -1150,20 +1236,17 @@ static lv_obj_t *build_clock_screen(void)
         lv_obj_set_style_border_color(notif_slot[i], lv_color_hex(0x505050), 0);
         lv_obj_clear_flag(notif_slot[i], LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_align(notif_slot[i], LV_ALIGN_LEFT_MID,
-                    i * (NOTIF_ICON_W + NOTIF_GAP), 0);
-
-        // --- ICON (center) --- (IMG icon)
         notif_icon_img[i] = lv_img_create(notif_slot[i]);
 
         const lv_img_dsc_t *src = icon_for_group((notif_type_t)i);
-        lv_img_set_src(notif_icon_img[i], src);
-
-        // These icons are ALPHA masks: recolor to white
-        lv_obj_set_style_img_recolor(notif_icon_img[i], lv_color_white(), 0);
-        lv_obj_set_style_img_recolor_opa(notif_icon_img[i], LV_OPA_COVER, 0);
-        lv_obj_center(notif_icon_img[i]);                 // simplest
-
+        if (src) {
+            lv_img_set_src(notif_icon_img[i], src);
+            lv_obj_set_style_img_recolor(notif_icon_img[i], lv_color_white(), 0);
+            lv_obj_set_style_img_recolor_opa(notif_icon_img[i], LV_OPA_COVER, 0);
+            lv_obj_center(notif_icon_img[i]);
+        } else {
+            lv_obj_add_flag(notif_icon_img[i], LV_OBJ_FLAG_HIDDEN);
+        }
 
         // -------------------------
         // BADGE (FAKE STROKE)
@@ -1201,7 +1284,14 @@ static lv_obj_t *build_clock_screen(void)
 
     // Reflect any existing counts
     notif_icons_refresh();
-
+    
+    lv_obj_t *menu = lv_btn_create(scr);
+    lv_obj_set_size(menu, 90, 50);
+    lv_obj_set_style_bg_color(menu, lv_color_black(), 0);
+    lv_obj_align(menu, LV_ALIGN_BOTTOM_LEFT, 12, -12);
+    lv_obj_add_event_cb(menu, on_back_to_home, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(menu), LV_SYMBOL_HOME);
+    lv_obj_center(lv_obj_get_child(menu, 0));
     return scr;
 }
 

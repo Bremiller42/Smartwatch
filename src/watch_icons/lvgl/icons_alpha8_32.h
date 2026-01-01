@@ -39,3 +39,4 @@
 #include "message_regular_full_a8_32.h"
 #include "envelope_regular_full_a8_32.h"
 #include "gear_solid_full_a8_32.h"
+#include "mobile_solid_full_a8_32.h"

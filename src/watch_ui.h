@@ -33,3 +33,8 @@ void ui_update_ble_status_async(void *arg);
 // watch_ui.h
 void ui_notif_add_from_ble(notif_type_t t);
 void ui_notif_refresh_async(void);
+extern lv_obj_t *phone_batt_lbl;
+extern int g_phone_batt_pct;
+extern bool g_phone_batt_charging;
+void ui_set_phone_batt(int pct, bool charging);
+void ui_clear_phone_batt(void);

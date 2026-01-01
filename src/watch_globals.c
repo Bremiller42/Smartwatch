@@ -20,7 +20,6 @@ lv_obj_t *ip_lbl = NULL;
 
 lv_obj_t *clock_ble_icon = NULL;
 lv_obj_t *clock_notification_icon_box = NULL;
-
 /* Set-time dialog state */
 lv_obj_t *settime_modal = NULL;
 lv_obj_t *settime_h_lbl = NULL;
@@ -28,6 +27,8 @@ lv_obj_t *settime_m_lbl = NULL;
 int set_h = 12;
 int set_m = 0;
 
+
+lv_obj_t *phone_batt_lbl = NULL;
 /* ---------------- Wi-Fi ---------------- */
 EventGroupHandle_t s_wifi_evgrp = NULL;
 esp_netif_t *s_sta_netif = NULL;
