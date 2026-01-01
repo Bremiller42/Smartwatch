@@ -12,7 +12,10 @@
 #include "watch_wifi.h"
 #include "watch_sleep.h"
 #include "watch_ui.h"
-
+#include "watch_heartrate.h"
+#include "esp_log.h"
+#include "freertos/task.h"
+#include "lvgl.h"
 
 #include <esp_log.h>
 #include <esp_flash.h>
@@ -28,7 +31,7 @@
 /* ---------------- MAIN_TAG ---------------- */  
 const char *MAIN_TAG = "SmartWatch";
 
-  
+
 static void init_logs_and_chipinfo(void)
 {
     esp_chip_info_t chip_info;
@@ -130,7 +133,7 @@ void setup(void)
         ESP_LOGI(MAIN_TAG, "Auto WiFi enabled from NVS -> starting STA");
         wifi_start_sta(g_wifi_ssid, g_wifi_pass);
     }
-
+    start_max30102_task();
     watch_audio_beep(880, 80);   // A5, 80ms
     watch_audio_beep(1320, 60);  // E6, 60ms
     watch_audio_beep(1760, 90);  // A6, 90ms

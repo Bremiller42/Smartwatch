@@ -7,6 +7,7 @@
 #include "watch_ble.h"
 #include "watch_audio.h"
 #include "watch_icons/watch_icons.h"
+#include "watch_heartrate.h"
 
 #include "display.h"
 #include "esp_bsp.h"
@@ -62,6 +63,7 @@ void on_wifi_pass_connect(lv_event_t *e);
 static void on_ble_toggle(lv_event_t *e);
 void ui_update_ble_status_async(void *arg);
 void ui_update_ble_icon_async(void *arg);
+static void on_hr_read_now(lv_event_t *e);
 
 // NEW (use this)
 static lv_obj_t *notif_icon_img[NG_MAX] = {0};
@@ -72,6 +74,8 @@ static lv_obj_t *notif_badge_stroke[NG_MAX][4] = {0};
 
 /* ---------------- Misc UI state ---------------- */
 static lv_obj_t *timeout_sub_lbl = NULL;
+static lv_obj_t *hr_period_sub_lbl = NULL;
+
 
 /* ---------------- Notifications (NEW BAR ONLY) ---------------- */
 #define NOTIF_ICON_W 40
@@ -92,6 +96,11 @@ static void notif_icons_refresh(void);
 static void notif_bar_relayout(void);
 int  g_phone_batt_pct = -1;
 bool g_phone_batt_charging = false;
+
+static lv_obj_t *hr_debug_lbl = NULL;
+static lv_obj_t *hr_btn = NULL;
+static lv_obj_t *hr_btn_icon = NULL;
+
 
 static void ui_notif_refresh_cb(void *arg)
 {
@@ -942,6 +951,20 @@ static lv_obj_t *tile_create_switch_tile(lv_obj_t *parent,
     return btn;
 }
 
+static void on_hr_read_now(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    // Kick an immediate HR window
+    hr_request_read_now();
+
+    // optional feedback beep
+    // watch_audio_beep(990, 80);
+
+    mark_user_activity();
+}
+
+
 /* ---------------- Timeout tile ---------------- */
 
 static uint32_t timeout_get_s(void)
@@ -976,6 +999,103 @@ static void on_timeout_tile_clicked(lv_event_t *e)
     timeout_update_subtitle();
     mark_user_activity();
 }
+
+typedef enum {
+    HRP_OFF = 0,
+    HRP_ALWAYS_ON,
+    HRP_30S,
+    HRP_1M,
+    HRP_5M,
+    HRP_10M,
+    HRP_1H,
+    HRP_MAX
+} hr_period_preset_t;
+
+static hr_period_preset_t s_hr_preset = HRP_1M; // default
+
+static void hr_period_apply_preset(hr_period_preset_t p)
+{
+    s_hr_preset = p;
+
+    switch (p) {
+        case HRP_OFF:
+            g_hr_period_ms = 0;
+            g_hr_run_ms = 0;
+            break;
+
+        case HRP_ALWAYS_ON:
+            // effectively continuous: 1s windows repeating
+            g_hr_period_ms = 1000;
+            g_hr_run_ms = 1000;
+            break;
+
+        case HRP_30S:
+            g_hr_period_ms = 30 * 1000;
+            g_hr_run_ms = 10 * 1000;
+            break;
+
+        case HRP_1M:
+            g_hr_period_ms = 60 * 1000;
+            g_hr_run_ms = 10 * 1000;
+            break;
+
+        case HRP_5M:
+            g_hr_period_ms = 5 * 60 * 1000;
+            g_hr_run_ms = 10 * 1000;
+            break;
+
+        case HRP_10M:
+            g_hr_period_ms = 10 * 60 * 1000;
+            g_hr_run_ms = 10 * 1000;
+            break;
+
+        case HRP_1H:
+            g_hr_period_ms = 60 * 60 * 1000;
+            g_hr_run_ms = 10 * 1000;
+            break;
+
+        default:
+            break;
+    }
+}
+
+static const char *hr_period_preset_text(hr_period_preset_t p)
+{
+    switch (p) {
+        case HRP_OFF:        return "Off";
+        case HRP_ALWAYS_ON:  return "Always On";
+        case HRP_30S:        return "30s";
+        case HRP_1M:         return "1m";
+        case HRP_5M:         return "5m";
+        case HRP_10M:        return "10m";
+        case HRP_1H:         return "1h";
+        default:             return "";
+    }
+}
+
+static void hr_period_update_subtitle(void)
+{
+    if (!hr_period_sub_lbl) return;
+    lv_label_set_text(hr_period_sub_lbl, hr_period_preset_text(s_hr_preset));
+}
+
+static void on_hr_period_tile_clicked(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    hr_period_preset_t next = (hr_period_preset_t)((s_hr_preset + 1) % HRP_MAX);
+    hr_period_apply_preset(next);
+    hr_period_update_subtitle();
+
+    // If user turns it on, you can optionally kick an immediate read
+    if (s_hr_preset != HRP_OFF) {
+        hr_request_read_now();
+    }
+
+    // TODO: later persist to NVS (settings_save_hr_period_preset(next);)
+    mark_user_activity();
+}
+
 
 /* ---------------- UI Callbacks ---------------- */
 
@@ -1121,6 +1241,10 @@ static void notif_bar_relayout(void)
     }
 }
 
+lv_obj_t* ui_get_hr_debug_lbl(void)
+{
+    return hr_debug_lbl;
+}
 
 /* ---------------- Screens ---------------- */
 
@@ -1193,6 +1317,38 @@ static lv_obj_t *build_clock_screen(void)
     // Anchor the label's RIGHT edge at the same spot you had before
     lv_obj_align_to(phone_batt_lbl, scr, LV_ALIGN_RIGHT_MID, -10, -45);
 
+    hr_debug_lbl = lv_label_create(scr);
+    lv_label_set_text(hr_debug_lbl, "");  // start blank
+    lv_obj_set_style_text_color(hr_debug_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(hr_debug_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_opa(hr_debug_lbl, LV_OPA_80, 0);
+
+    // Example placement: top-right area under phone battery
+    lv_obj_set_width(hr_debug_lbl, 120);
+    lv_obj_set_style_text_align(hr_debug_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align_to(hr_debug_lbl, scr, LV_ALIGN_RIGHT_MID, -50, -10);
+
+ // --- HR "read now" button (icon) under hr_debug_lbl ---
+    hr_btn = lv_btn_create(scr);
+    lv_obj_set_size(hr_btn, 44, 44);
+    lv_obj_set_style_radius(hr_btn, 10, 0);
+    lv_obj_set_style_bg_color(hr_btn, lv_color_hex(0x101010), 0);
+    lv_obj_set_style_bg_opa(hr_btn, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(hr_btn, 1, 0);
+    lv_obj_set_style_border_color(hr_btn, lv_color_hex(0x404040), 0);
+    lv_obj_clear_flag(hr_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(hr_btn, on_hr_read_now, LV_EVENT_CLICKED, NULL);
+
+    // place it directly below the hr_debug_lbl (right-aligned)
+    lv_obj_align_to(hr_btn, hr_debug_lbl, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 8);
+
+    hr_btn_icon = lv_img_create(hr_btn);
+    lv_img_set_src(hr_btn_icon, &heart_pulse_solid_full_a8_32);
+    lv_obj_center(hr_btn_icon);
+    lv_obj_set_style_img_recolor(hr_btn_icon, lv_color_white(), 0);
+    lv_obj_set_style_img_recolor_opa(hr_btn_icon, LV_OPA_COVER, 0);
+    lv_obj_set_style_img_recolor(hr_btn_icon, lv_color_hex(0xFF5555),
+                                LV_STATE_PRESSED);
 
     clock_update_label_now();
     clock_update_wifi_icon_now();
@@ -1414,6 +1570,15 @@ static lv_obj_t *build_settings_screen(void)
 
     lv_obj_t *t_set = tile_create_nav_tile(g_time, "Set Time", "Manual", on_open_settime);
     lv_obj_set_grid_cell(t_set, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+    lv_obj_t *t_hr = tile_create_base(g_time, "Heart Rate", "", &hr_period_sub_lbl);
+    tile_set_on(t_hr, true); // show as “active”/blue since it’s a config tile
+    lv_obj_set_grid_cell(t_hr, LV_GRID_ALIGN_CENTER, 2, 1, LV_GRID_ALIGN_CENTER, 1, 1);
+
+    // init preset default + subtitle
+    hr_period_apply_preset(s_hr_preset);
+    hr_period_update_subtitle();
+
+    lv_obj_add_event_cb(t_hr, on_hr_period_tile_clicked, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *t_date = tile_create_base(g_time, "Date", "Later", NULL);
     tile_set_on(t_date, false);
