@@ -39,3 +39,4 @@ extern bool g_phone_batt_charging;
 void ui_set_phone_batt(int pct, bool charging);
 void ui_clear_phone_batt(void);
 lv_obj_t* ui_get_hr_debug_lbl(void);
+void ui_set_watch_batt_async(void *arg);

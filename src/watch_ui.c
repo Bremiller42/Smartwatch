@@ -8,13 +8,15 @@
 #include "watch_audio.h"
 #include "watch_icons/watch_icons.h"
 #include "watch_heartrate.h"
-
+#include "watch_i2c.h"
+#include "watch_fuel.h"
 #include "display.h"
 #include "esp_bsp.h"
 #include "lv_port.h"
 #include "fonts/orbitron_72.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include <stdio.h>
 #include <time.h>
@@ -65,6 +67,8 @@ void ui_update_ble_status_async(void *arg);
 void ui_update_ble_icon_async(void *arg);
 static void on_hr_read_now(lv_event_t *e);
 
+static void on_wifi_forget_clicked(lv_event_t *e);
+
 // NEW (use this)
 static lv_obj_t *notif_icon_img[NG_MAX] = {0};
 
@@ -100,6 +104,8 @@ bool g_phone_batt_charging = false;
 static lv_obj_t *hr_debug_lbl = NULL;
 static lv_obj_t *hr_btn = NULL;
 static lv_obj_t *hr_btn_icon = NULL;
+
+static lv_obj_t *watch_batt_lbl = NULL;
 
 
 static void ui_notif_refresh_cb(void *arg)
@@ -339,10 +345,43 @@ void ui_set_phone_batt(int pct, bool charging)
     g_phone_batt_pct = pct;
     g_phone_batt_charging = charging;
     lv_async_call(ui_update_phone_batt_cb, NULL);
-ESP_LOGI(UI_TAG, "Phone Batt Set %d%% charging=%d", g_phone_batt_pct, (int)g_phone_batt_charging);
-
+    ESP_LOGI(UI_TAG, "Phone Batt Set %d%% charging=%d", g_phone_batt_pct, (int)g_phone_batt_charging);
 }
 
+extern float g_watch_batt_v;    // from watch_fuel.c
+static int s_watch_batt_pct = -1;
+
+static void ui_update_watch_batt_cb(void *arg)
+{
+    (void)arg;
+    if (!watch_batt_lbl) return;
+
+    if (s_watch_batt_pct < 0 || s_watch_batt_pct > 100 || g_watch_batt_v <= 0.0f) {
+        lv_label_set_text(watch_batt_lbl, "--%%");
+        return;
+    }
+
+    lv_obj_clear_flag(watch_batt_lbl, LV_OBJ_FLAG_HIDDEN);
+
+    static char buf[40];
+    // Example: "🔋 84% 3.98V" (using LVGL symbols)
+    snprintf(buf, sizeof(buf), "%s %d%% %.2fV", LV_SYMBOL_BATTERY_FULL, s_watch_batt_pct, g_watch_batt_v);
+    lv_label_set_text(watch_batt_lbl, buf);
+}
+
+void ui_set_watch_batt(int pct, float volts_unused)
+{
+    (void)volts_unused; // we read g_watch_batt_v directly
+    s_watch_batt_pct = pct;
+    lv_async_call(ui_update_watch_batt_cb, NULL);
+}
+
+void ui_set_watch_batt_async(void *arg)
+{
+    int pct = (int)(intptr_t)arg;
+    // call your UI setter (either keep 2 args, or simplify it)
+    ui_set_watch_batt(pct, g_watch_batt_v);
+}
 
 /* ---------------- Notifications Bar ---------------- */
 
@@ -465,6 +504,13 @@ void open_wifi_picker_modal(lv_obj_t *parent)
     lv_obj_add_event_cb(btn_close, on_wifi_picker_close, LV_EVENT_CLICKED, NULL);
     lv_label_set_text(lv_label_create(btn_close), "Close");
     lv_obj_center(lv_obj_get_child(btn_close, 0));
+
+    lv_obj_t *btn_frgt = lv_btn_create(card);
+    lv_obj_set_size(btn_frgt, 90, 32);
+    lv_obj_align(btn_frgt, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_event_cb(btn_frgt, on_wifi_forget_clicked, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(btn_frgt), "Forget");
+    lv_obj_center(lv_obj_get_child(btn_frgt, 0));
 
     lv_obj_t *btn_scan = lv_btn_create(card);
     lv_obj_set_size(btn_scan, 90, 32);
@@ -1011,7 +1057,7 @@ typedef enum {
     HRP_MAX
 } hr_period_preset_t;
 
-static hr_period_preset_t s_hr_preset = HRP_1M; // default
+static hr_period_preset_t s_hr_preset = HRP_OFF; // default
 
 static void hr_period_apply_preset(hr_period_preset_t p)
 {
@@ -1246,6 +1292,19 @@ lv_obj_t* ui_get_hr_debug_lbl(void)
     return hr_debug_lbl;
 }
 
+static void on_wifi_forget_clicked(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    wifi_forget_saved();                 // clears creds + stops wifi
+    // Optional: update icons immediately
+    lv_async_call(ui_update_wifi_icon_async, NULL);
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) start_wifi_scan();
+
+
+}
+
+
 /* ---------------- Screens ---------------- */
 
 static lv_obj_t *build_home_screen(void)
@@ -1275,7 +1334,6 @@ static lv_obj_t *build_home_screen(void)
 
 static lv_obj_t *build_clock_screen(void)
 {
-
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -1304,6 +1362,18 @@ static lv_obj_t *build_clock_screen(void)
     lv_obj_align_to(clock_ble_icon, clock_wifi_icon, LV_ALIGN_OUT_LEFT_MID, -5, 0);
     lv_label_set_text(clock_ble_icon, LV_SYMBOL_BLUETOOTH);
 
+    watch_batt_lbl = lv_label_create(scr);
+    lv_label_set_text(watch_batt_lbl, "--%%");
+    lv_obj_set_style_text_color(watch_batt_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(watch_batt_lbl, &lv_font_montserrat_16, 0);
+
+    // fixed width so it doesn't jump
+    lv_obj_set_width(watch_batt_lbl, 110);
+    lv_obj_set_style_text_align(watch_batt_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+
+    lv_obj_align_to(watch_batt_lbl, clock_ble_icon, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+
+
     phone_batt_lbl = lv_label_create(scr);
     lv_label_set_text(phone_batt_lbl, "");   // hidden until data arrives
 
@@ -1326,7 +1396,7 @@ static lv_obj_t *build_clock_screen(void)
     // Example placement: top-right area under phone battery
     lv_obj_set_width(hr_debug_lbl, 120);
     lv_obj_set_style_text_align(hr_debug_lbl, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_align_to(hr_debug_lbl, scr, LV_ALIGN_RIGHT_MID, -50, -10);
+    lv_obj_align_to(hr_debug_lbl, scr, LV_ALIGN_RIGHT_MID, -70, -10);
 
  // --- HR "read now" button (icon) under hr_debug_lbl ---
     hr_btn = lv_btn_create(scr);
@@ -1340,7 +1410,7 @@ static lv_obj_t *build_clock_screen(void)
     lv_obj_add_event_cb(hr_btn, on_hr_read_now, LV_EVENT_CLICKED, NULL);
 
     // place it directly below the hr_debug_lbl (right-aligned)
-    lv_obj_align_to(hr_btn, hr_debug_lbl, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 8);
+    lv_obj_align_to(hr_btn, hr_debug_lbl, LV_ALIGN_OUT_RIGHT_MID, 20, 10);
 
     hr_btn_icon = lv_img_create(hr_btn);
     lv_img_set_src(hr_btn_icon, &heart_pulse_solid_full_a8_32);
@@ -1570,6 +1640,7 @@ static lv_obj_t *build_settings_screen(void)
 
     lv_obj_t *t_set = tile_create_nav_tile(g_time, "Set Time", "Manual", on_open_settime);
     lv_obj_set_grid_cell(t_set, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+    
     lv_obj_t *t_hr = tile_create_base(g_time, "Heart Rate", "", &hr_period_sub_lbl);
     tile_set_on(t_hr, true); // show as “active”/blue since it’s a config tile
     lv_obj_set_grid_cell(t_hr, LV_GRID_ALIGN_CENTER, 2, 1, LV_GRID_ALIGN_CENTER, 1, 1);

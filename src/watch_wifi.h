@@ -9,3 +9,4 @@ int  wifi_get_rssi_dbm(int *out_rssi);
 
 /* scanning */
 void start_wifi_scan(void);
+void wifi_forget_saved(void);

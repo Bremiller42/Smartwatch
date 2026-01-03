@@ -7,39 +7,44 @@
 #include <stdbool.h>
 
 static const char *TAG = "i2c1";
-static esp_err_t i2c_probe_addr(i2c_port_t port, uint8_t addr_7bit, TickType_t timeout)
+static SemaphoreHandle_t s_i2c_mutex = NULL;
+static SemaphoreHandle_t s_init_mux  = NULL;
+static bool inited = false;
+
+static esp_err_t i2c_lock(TickType_t to)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    if (!cmd) return ESP_ERR_NO_MEM;
-
-    i2c_master_start(cmd);
-    // Send address + write bit; expect ACK if device exists
-    i2c_master_write_byte(cmd, (addr_7bit << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_stop(cmd);
-
-    esp_err_t ret = i2c_master_cmd_begin(port, cmd, timeout);
-    i2c_cmd_link_delete(cmd);
-    return ret;
+    if (!s_i2c_mutex) return ESP_ERR_INVALID_STATE;
+    return (xSemaphoreTake(s_i2c_mutex, to) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
-
-static void i2c_scan(void)
+static void i2c_unlock(void)
 {
-    ESP_LOGI(TAG, "Scanning I2C port %d...", (int)WATCH_I2C_PORT);
-
-    int found = 0;
-    for (int addr = 1; addr < 127; addr++) {
-        if (i2c_probe_addr(WATCH_I2C_PORT, (uint8_t)addr, pdMS_TO_TICKS(20)) == ESP_OK) {
-            ESP_LOGI(TAG, "Found device at 0x%02X", addr);
-            found++;
-        }
-    }
-    ESP_LOGI(TAG, "Scan done. Found %d device(s).", found);
+    if (s_i2c_mutex) xSemaphoreGive(s_i2c_mutex);
 }
 
 esp_err_t watch_i2c_init(void)
 {
-    static bool inited = false;
+    esp_err_t err = ESP_OK;
+
+    // Create mutexes once
+    if (!s_i2c_mutex) {
+        s_i2c_mutex = xSemaphoreCreateMutex();
+        if (!s_i2c_mutex) return ESP_ERR_NO_MEM;
+    }
+    if (!s_init_mux) {
+        s_init_mux = xSemaphoreCreateMutex();
+        if (!s_init_mux) return ESP_ERR_NO_MEM;
+    }
+
     if (inited) return ESP_OK;
+
+    if (xSemaphoreTake(s_init_mux, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (inited) {
+        xSemaphoreGive(s_init_mux);
+        return ESP_OK;
+    }
 
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -51,21 +56,48 @@ esp_err_t watch_i2c_init(void)
         .clk_flags = 0
     };
 
-    ESP_RETURN_ON_ERROR(i2c_param_config(WATCH_I2C_PORT, &conf), TAG, "i2c_param_config failed");
-
-    esp_err_t err = i2c_driver_install(WATCH_I2C_PORT, conf.mode, 0, 0, 0);
-    if (err == ESP_ERR_INVALID_STATE) {
-        // already installed (fine) — still scan
-        ESP_LOGW(TAG, "I2C port %d driver already installed; reusing", (int)WATCH_I2C_PORT);
-        inited = true;
-        i2c_scan();
-        return ESP_OK;
+    err = i2c_param_config(WATCH_I2C_PORT, &conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2c_param_config failed: %s", esp_err_to_name(err));
+        goto out;
     }
-    ESP_RETURN_ON_ERROR(err, TAG, "i2c_driver_install failed");
+
+    err = i2c_driver_install(WATCH_I2C_PORT, conf.mode, 0, 0, 0);
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "I2C port %d already installed; reusing", (int)WATCH_I2C_PORT);
+        err = ESP_OK;
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2c_driver_install failed: %s", esp_err_to_name(err));
+        goto out;
+    }
 
     inited = true;
     ESP_LOGI(TAG, "I2C init OK on port %d", (int)WATCH_I2C_PORT);
 
-    i2c_scan();
-    return ESP_OK;
+out:
+    xSemaphoreGive(s_init_mux);
+    return err;
+}
+
+esp_err_t watch_i2c_write_read(uint8_t addr7, const uint8_t *w, size_t wl,
+                               uint8_t *r, size_t rl, TickType_t to)
+{
+    esp_err_t err = i2c_lock(to);
+    if (err != ESP_OK) return err;
+
+    err = i2c_master_write_read_device(WATCH_I2C_PORT, addr7, w, wl, r, rl, to);
+
+    i2c_unlock();
+    return err;
+}
+
+esp_err_t watch_i2c_write(uint8_t addr7, const uint8_t *w, size_t wl, TickType_t to)
+{
+    esp_err_t err = i2c_lock(to);
+    if (err != ESP_OK) return err;
+
+    err = i2c_master_write_to_device(WATCH_I2C_PORT, addr7, w, wl, to);
+
+    i2c_unlock();
+    return err;
 }

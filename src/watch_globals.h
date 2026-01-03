@@ -155,3 +155,4 @@ extern uint16_t g_notif_counts[NG_MAX];
 extern volatile bool g_notif_dirty;
 extern lv_obj_t *phone_batt_lbl;
 
+extern int delay_ms; // default 60s

@@ -22,9 +22,26 @@ static const char *HR_TAG = "HEART";
  *  Scheduling controls (set from Settings later)
  * ============================= */
 // How long to actively sample each cycle (ms)
-uint32_t g_hr_run_ms    = 10 * 1000;   // default: 10 seconds
+uint32_t g_hr_run_ms    = 0;   // default: 10 seconds
 // How often to run a cycle (ms)
-uint32_t g_hr_period_ms = 60 * 1000;   // default: every 60 seconds
+uint32_t g_hr_period_ms = 0;   // default: every 60 seconds
+// Enable/disable verbose raw logging (1 = on, 0 = off)
+#ifndef HR_LOG_RAW
+#define HR_LOG_RAW  1
+#endif
+
+// How often to print raw values when logging (ms)
+#ifndef HR_LOG_RAW_EVERY_MS
+#define HR_LOG_RAW_EVERY_MS  200
+#endif
+
+static uint32_t HR_AC_MIN = 30;     // wrist often low amplitude
+static uint32_t HR_DC_MIN = 20000;
+static uint32_t HR_DC_MAX = 250000;
+
+// BPM bounds
+static float HR_BPM_MIN = 40.0f;
+static float HR_BPM_MAX = 200.0f;
 
 /* =============================
  *  MAX30102 registers (subset)
@@ -61,12 +78,12 @@ static TaskHandle_t s_hr_task = NULL;
 static esp_err_t wr(uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = { reg, val };
-    return i2c_master_write_to_device(WATCH_I2C_PORT, MAX30102_ADDR, buf, sizeof(buf), pdMS_TO_TICKS(50));
+    return watch_i2c_write(MAX30102_ADDR, buf, sizeof(buf), pdMS_TO_TICKS(50));
 }
 
 static esp_err_t rd(uint8_t reg, uint8_t *data, size_t len)
 {
-    return i2c_master_write_read_device(WATCH_I2C_PORT, MAX30102_ADDR, &reg, 1, data, len, pdMS_TO_TICKS(50));
+    return watch_i2c_write_read(MAX30102_ADDR, &reg, 1, data, len, pdMS_TO_TICKS(50));
 }
 
 /* “Is it there?” probe: safe 1-byte register read */
@@ -110,7 +127,7 @@ static esp_err_t max30102_init(void)
     if (err != ESP_OK) return err;
 
     // FIFO config
-    err = wr(REG_FIFO_CONFIG, 0x00);
+    err = wr(REG_FIFO_CONFIG, (2 << 5));
     if (err != ESP_OK) return err;
 
     // Reset FIFO pointers
@@ -157,23 +174,143 @@ static esp_err_t max30102_read_sample(max30102_sample_t *out)
     out->ir  = ir;
     return ESP_OK;
 }
+typedef struct {
+    // DC estimate (IIR low-pass)
+    float dc;
+
+    // Smoothed AC (after DC removal)
+    float ac_smooth;
+
+    // For peak detection
+    float prev;
+    float prev2;
+
+    // amplitude tracking
+    float ac_abs_avg;
+} ppg_filter_t;
+
+static void ppg_filter_reset(ppg_filter_t *f, float init_dc)
+{
+    f->dc = init_dc;
+    f->ac_smooth = 0;
+    f->prev = 0;
+    f->prev2 = 0;
+    f->ac_abs_avg = 0;
+}
+
+// returns filtered AC value
+static float ppg_filter_step(ppg_filter_t *f, float x)
+{
+    // 1) DC low-pass (slow)
+    // alpha_dc closer to 1 => slower DC tracking (good)
+    const float alpha_dc = 0.995f;
+    f->dc = alpha_dc * f->dc + (1.0f - alpha_dc) * x;
+
+    // 2) AC component
+    float ac = x - f->dc;
+
+    // 3) Smooth AC a bit (low-pass)
+    const float alpha_lp = 0.85f;
+    f->ac_smooth = alpha_lp * f->ac_smooth + (1.0f - alpha_lp) * ac;
+
+    // 4) Track average abs amplitude (for “signal quality”)
+    float abs_ac = (f->ac_smooth < 0) ? -f->ac_smooth : f->ac_smooth;
+    const float alpha_amp = 0.95f;
+    f->ac_abs_avg = alpha_amp * f->ac_abs_avg + (1.0f - alpha_amp) * abs_ac;
+
+    return f->ac_smooth;
+}
+
+typedef struct {
+    int peaks;
+    uint32_t last_peak_ms;
+    float bpm;          // latest estimate
+    float bpm_avg;      // smoothed
+    bool bpm_valid;
+} hr_est_t;
+
+static void hr_est_reset(hr_est_t *h)
+{
+    h->peaks = 0;
+    h->last_peak_ms = 0;
+    h->bpm = 0;
+    h->bpm_avg = 0;
+    h->bpm_valid = false;
+}
+
+// very simple local-max peak detection on AC waveform
+static void hr_process_sample(hr_est_t *h, ppg_filter_t *f, float ac, uint32_t now_ms)
+{
+    float a = f->prev2;
+    float b = f->prev;
+    float c = ac;
+
+    float thr = (float)HR_AC_MIN;
+    float adaptive = 0.60f * f->ac_abs_avg;
+    if (adaptive > thr) thr = adaptive;
+
+    const uint32_t refractory_ms = 250;
+
+    bool is_local_max = (b > a && b > c);
+    bool above_thr = (b > thr);
+
+    if (is_local_max && above_thr) {
+        if (h->last_peak_ms == 0 || (now_ms - h->last_peak_ms) >= refractory_ms) {
+
+            if (h->last_peak_ms != 0) {
+                uint32_t dt = now_ms - h->last_peak_ms;
+                float bpm = 60000.0f / (float)dt;
+
+                if (bpm >= HR_BPM_MIN && bpm <= HR_BPM_MAX) {
+                    h->bpm = bpm;
+                    h->bpm_avg = (h->bpm_avg <= 0.1f) ? bpm : (0.85f*h->bpm_avg + 0.15f*bpm);
+                    h->bpm_valid = true;
+                } else {
+                    h->bpm_valid = false;
+                }
+            }
+
+            h->last_peak_ms = now_ms;
+            h->peaks++;
+        }
+    }
+
+    // shift history LAST
+    f->prev2 = f->prev;
+    f->prev = ac;
+}
+
 
 /* =============================
  *  UI update (rate-limited by task)
  * ============================= */
+static float g_dc_ir = 0;
+static float g_ac_amp = 0;
+static float g_bpm = 0;
+static bool  g_bpm_valid = false;
+
 static void ui_update_max_async(void *arg)
 {
     (void)arg;
     lv_obj_t *lbl = ui_get_hr_debug_lbl();
     if (!lbl) return;
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "RED:%" PRIu32 " IR:%" PRIu32, g_red, g_ir);
+    char buf[96];
+    if (g_bpm_valid) {
+        snprintf(buf, sizeof(buf),
+                 "IR:%" PRIu32 " DC:%.0f AMP:%.0f\nBPM:%.0f",
+                 g_ir, g_dc_ir, g_ac_amp, g_bpm);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "IR:%" PRIu32 " DC:%.0f AMP:%.0f\nBPM: --",
+                 g_ir, g_dc_ir, g_ac_amp);
+    }
 
     bsp_display_lock(0);
     lv_label_set_text(lbl, buf);
     bsp_display_unlock();
 }
+
 
 /* =============================
  *  Public: Read-now trigger (UI button calls this)
@@ -197,8 +334,7 @@ static void max_task(void *arg)
     esp_err_t err = watch_i2c_init();
     if (err != ESP_OK) {
         ESP_LOGE(HR_TAG, "I2C init failed: %s", esp_err_to_name(err));
-        vTaskDelete(NULL);
-        return;
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     // Timing knobs
@@ -269,11 +405,34 @@ static void max_task(void *arg)
         }
 
         s_max_present = true;
+        // --- Warmup / settle ---
+        // Drain a few samples and initialize DC to a real value
+        ppg_filter_t filt;
+        hr_est_t hr;
+        hr_est_reset(&hr);
+
+        max30102_sample_t warm;
+        uint32_t good = 0;
+        uint32_t ir_sum = 0;
+
+        // grab ~25 good samples (~0.5s at 50Hz) to find a stable starting DC
+        for (int i = 0; i < 25; i++) {
+            if (max30102_read_sample(&warm) == ESP_OK && warm.ir > 1000) {
+                ir_sum += warm.ir;
+                good++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        uint32_t ir0 = (good > 0) ? (ir_sum / good) : g_ir;
+        ppg_filter_reset(&filt, (float)ir0);
 
         TickType_t window_start = xTaskGetTickCount();
         TickType_t next_ui = window_start; // UI update cadence
 
-        // sample loop
+        uint32_t last_raw_log_ms = 0;
+        // uint32_t next_log_ms = esp_log_timestamp();
+
         while ((xTaskGetTickCount() - window_start) < run_ticks) {
 
             max30102_sample_t s;
@@ -282,6 +441,47 @@ static void max_task(void *arg)
             if (err == ESP_OK) {
                 g_red = s.red;
                 g_ir  = s.ir;
+                uint32_t now_ms = (uint32_t)esp_log_timestamp();
+
+                // 1) Contact/DC sanity
+                g_dc_ir = filt.dc; // will update after step, but ok
+
+                // 2) Filter step on IR
+                float ac = ppg_filter_step(&filt, (float)g_ir);
+
+                // 3) expose for UI/quality
+                g_dc_ir = filt.dc;
+                g_ac_amp = filt.ac_abs_avg;
+
+                // 4) peak detect / bpm
+                // Only attempt if DC looks like contact
+                bool dc_ok = (filt.dc >= (float)HR_DC_MIN && filt.dc <= (float)HR_DC_MAX);
+                if (dc_ok) {
+                    hr_process_sample(&hr, &filt, ac, now_ms);
+                } else {
+                    hr.bpm_valid = false;
+                }
+
+                // 5) accept BPM only if amplitude is decent + enough time
+                bool amp_ok = (filt.ac_abs_avg >= (float)HR_AC_MIN);
+                g_bpm_valid = (hr.bpm_valid && amp_ok && dc_ok);
+                g_bpm = (g_bpm_valid ? hr.bpm_avg : 0);
+
+                // 6) optional raw logging
+                #if HR_LOG_RAW
+                if ((now_ms - last_raw_log_ms) >= HR_LOG_RAW_EVERY_MS) {
+                    last_raw_log_ms = now_ms;
+                    ESP_LOGI(HR_TAG,
+                    "TUNE ir=%" PRIu32 " dc=%.0f ac=%.1f amp=%.1f bpm_valid=%d bpm=%.1f",
+                    g_ir,
+                    filt.dc,
+                    ac,
+                    filt.ac_abs_avg,
+                    (int)g_bpm_valid,
+                    g_bpm);
+                }
+                
+                #endif
 
                 // UI update ~5 Hz (every 200ms)
                 TickType_t t = xTaskGetTickCount();

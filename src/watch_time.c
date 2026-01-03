@@ -5,7 +5,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sntp.h"
-
+#include "watch_i2c.h"
 #include <time.h>
 #include <sys/time.h>
 #include <stdlib.h>

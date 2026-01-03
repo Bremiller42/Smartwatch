@@ -1,36 +1,36 @@
-#include <lvgl.h>
+// FILE: main.c
+
+#include <inttypes.h>
+#include <stdio.h>
+
+#include "esp_bsp.h"
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_system.h"
+
+#include "freertos/task.h"
 
 #include "display.h"
-#include "esp_bsp.h"
 #include "lv_port.h"
-#include "watch_ble.h"
+
 #include "watch_audio.h"
-
+#include "watch_ble.h"
+#include "watch_fuel.h"
 #include "watch_globals.h"
-#include "watch_settings.h"
-#include "watch_time.h"
-#include "watch_wifi.h"
-#include "watch_sleep.h"
-#include "watch_ui.h"
 #include "watch_heartrate.h"
-#include "esp_log.h"
-#include "freertos/task.h"
-#include "lvgl.h"
+#include "watch_i2c.h"
+#include "watch_settings.h"
+#include "watch_sleep.h"
+#include "watch_time.h"
+#include "watch_ui.h"
+#include "watch_wifi.h"
 
-#include <esp_log.h>
-#include <esp_flash.h>
-#include <esp_chip_info.h>
-#include <esp_system.h>
-#include <esp_heap_caps.h>
-#include <inttypes.h>
+static const char *MAIN_TAG = "SmartWatch";
 
-#define logSection(section) \
-  ESP_LOGI(MAIN_TAG, "\n\n************* %s **************\n", section);
-
-
-/* ---------------- MAIN_TAG ---------------- */  
-const char *MAIN_TAG = "SmartWatch";
-
+#define LOG_SECTION(section) \
+    ESP_LOGI(MAIN_TAG, "\n\n************* %s **************\n", (section))
 
 static void init_logs_and_chipinfo(void)
 {
@@ -61,46 +61,9 @@ static void init_logs_and_chipinfo(void)
     ESP_LOGI(MAIN_TAG, "Free PSRAM: %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
-
-
-void setup(void);
-
-#if !CONFIG_AUTOSTART_ARDUINO
-void app_main(void)
+static void display_init(void)
 {
-    
-    setup();
-}
-#endif
-
-void setup(void)
-{
-    esp_log_level_set("*", ESP_LOG_INFO);
-    esp_log_level_set(MAIN_TAG, ESP_LOG_INFO);
-
-    watch_audio_init();
-    watch_audio_beep_async_init();
-
-    logSection("Smartwatch start");
-    init_logs_and_chipinfo();
-
-    logSection("Initialize NVS settings");
-    settings_nvs_init();
-
-    settings_load_from_nvs();
-
-    logSection("Initialize BLE");
-    ble_init(NULL);
-    if (g_ble_on) {
-        ble_start();
-    }
-
-
-    logSection("Initialize time zone");
-    time_set_timezone();
-    time_restore_last_known();
-
-    logSection("Initialize panel device");
+    LOG_SECTION("Initialize panel device");
 
     bsp_display_cfg_t cfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
@@ -118,29 +81,89 @@ void setup(void)
 
     bsp_display_start_with_config(&cfg);
 
+    // Apply backlight early (user setting)
     apply_backlight_percent(g_brightness);
+}
 
-    logSection("Create UI");
+static void ui_init(void)
+{
+    LOG_SECTION("Create UI");
     bsp_display_lock(0);
-    
     create_watch_ui();
     bsp_display_unlock();
+}
 
-    logSection("Init sleep system");
+static void bringup_services(void)
+{
+    LOG_SECTION("Init sleep system");
     sleep_system_init();
 
+    // WiFi autostart (only if enabled AND has SSID)
     if (g_wifi_on && g_wifi_ssid[0]) {
         ESP_LOGI(MAIN_TAG, "Auto WiFi enabled from NVS -> starting STA");
         wifi_start_sta(g_wifi_ssid, g_wifi_pass);
     }
-    start_max30102_task();
-    watch_audio_beep(880, 80);   // A5, 80ms
-    watch_audio_beep(1320, 60);  // E6, 60ms
-    watch_audio_beep(1760, 90);  // A6, 90ms
 
-    logSection("Smartwatch ready");
+    // I2C MUST be up before any sensor tasks that use it
+    LOG_SECTION("Init I2C");
+    ESP_ERROR_CHECK(watch_i2c_init());
+
+    // Start sensor/service tasks AFTER I2C
+    start_max30102_task();
+    watch_fuel_start_task();
+}
+
+void setup(void);
+
+#if !CONFIG_AUTOSTART_ARDUINO
+void app_main(void)
+{
+    setup();
+}
+#endif
+
+void setup(void)
+{
+    // Logging policy: keep INFO globally, but avoid noisy spam in hot paths (BLE RX etc).
+    esp_log_level_set("*", ESP_LOG_INFO);
+    esp_log_level_set(MAIN_TAG, ESP_LOG_INFO);
+
+    // Audio init early (boot sounds + any beeps later)
+    watch_audio_init();
+    watch_audio_beep_async_init();
+
+    LOG_SECTION("Smartwatch start");
+    init_logs_and_chipinfo();
+
+    LOG_SECTION("Initialize NVS settings");
+    settings_nvs_init();
+    settings_load_from_nvs();
+
+    LOG_SECTION("Initialize BLE");
+    ble_init(NULL);
+    if (g_ble_on) {
+        ble_start();
+    }
+
+    LOG_SECTION("Initialize time zone");
+    time_set_timezone();
+    time_restore_last_known();
+
+    display_init();
+    ui_init();
+
+    // Boot chime (keep short)
+    watch_audio_beep(880,  60);
+    watch_audio_beep(1320, 50);
+    watch_audio_beep(1760, 70);
+
+    LOG_SECTION("Bring up services");
+    bringup_services();
+
+    LOG_SECTION("Smartwatch ready");
 }
 
 void loop(void)
 {
+    // No Arduino loop used (ESP-IDF tasks drive everything)
 }
