@@ -9,11 +9,11 @@
 #include "esp_timer.h"
 
 #include "lvgl.h"
-#include "watch_ui.h"      // ui_get_hr_debug_lbl()
 #include "watch_i2c.h"
-
+#include "watch_heartrate.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <stdlib.h>
 
 #define MAX30102_ADDR           0x57
 static const char *HR_TAG = "HEART";
@@ -60,15 +60,9 @@ static float HR_BPM_MAX = 200.0f;
 #define REG_LED1_PA             0x0C   // RED
 #define REG_LED2_PA             0x0D   // IR
 
-typedef struct {
-    uint32_t red;
-    uint32_t ir;
-} max30102_sample_t;
-
 /* =============================
  *  State
  * ============================= */
-static uint32_t g_red = 0, g_ir = 0;
 static bool s_max_present = false;
 static TaskHandle_t s_hr_task = NULL;
 
@@ -87,25 +81,53 @@ static esp_err_t rd(uint8_t reg, uint8_t *data, size_t len)
 }
 
 /* “Is it there?” probe: safe 1-byte register read */
-static esp_err_t max30102_probe(void)
+esp_err_t max30102_probe(void)
 {
     uint8_t tmp = 0;
     return rd(REG_INTR_STATUS_1, &tmp, 1);
 }
+static hr_ui_status_t s_ui = {
+    .state = HR_STATE_IDLE,
+    .session_ms_total = 15000,
+    .bpm_last = 0,
+};
+static portMUX_TYPE s_ui_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void hr_get_ui_status(hr_ui_status_t *out)
+{
+    if (!out) return;
+    portENTER_CRITICAL(&s_ui_mux);
+    *out = s_ui;
+    portEXIT_CRITICAL(&s_ui_mux);
+}
 
 /* Put sensor into low-power shutdown */
-static void max30102_shutdown_best_effort(void)
+void max30102_shutdown_best_effort(void)
 {
     // MODE_CONFIG bit7 = SHDN
     (void)wr(REG_MODE_CONFIG, 0x80);
 }
+static int cmp_f(const void *a, const void *b)
+{
+    float fa = *(const float*)a, fb = *(const float*)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static float median_f(float *arr, int n)
+{
+    if (n <= 0) return 0;
+    qsort(arr, n, sizeof(float), cmp_f);
+    if (n & 1) return arr[n/2];
+    return 0.5f * (arr[n/2 - 1] + arr[n/2]);
+}
+
 
 /* Init/configure sensor; returns:
  * - ESP_OK when initialized
  * - ESP_ERR_NOT_FOUND if missing/unplugged
  * - other errors for bus/protocol issues
  */
-static esp_err_t max30102_init(void)
+ esp_err_t max30102_init(void)
 {
     esp_err_t err = max30102_probe();
     if (err != ESP_OK) return ESP_ERR_NOT_FOUND;
@@ -156,7 +178,7 @@ static esp_err_t max30102_init(void)
     return ESP_OK;
 }
 
-static esp_err_t max30102_read_sample(max30102_sample_t *out)
+esp_err_t max30102_read_sample(max30102_sample_t *out)
 {
     if (!out) return ESP_ERR_INVALID_ARG;
 
@@ -280,38 +302,6 @@ static void hr_process_sample(hr_est_t *h, ppg_filter_t *f, float ac, uint32_t n
     f->prev = ac;
 }
 
-
-/* =============================
- *  UI update (rate-limited by task)
- * ============================= */
-static float g_dc_ir = 0;
-static float g_ac_amp = 0;
-static float g_bpm = 0;
-static bool  g_bpm_valid = false;
-
-static void ui_update_max_async(void *arg)
-{
-    (void)arg;
-    lv_obj_t *lbl = ui_get_hr_debug_lbl();
-    if (!lbl) return;
-
-    char buf[96];
-    if (g_bpm_valid) {
-        snprintf(buf, sizeof(buf),
-                 "IR:%" PRIu32 " DC:%.0f AMP:%.0f\nBPM:%.0f",
-                 g_ir, g_dc_ir, g_ac_amp, g_bpm);
-    } else {
-        snprintf(buf, sizeof(buf),
-                 "IR:%" PRIu32 " DC:%.0f AMP:%.0f\nBPM: --",
-                 g_ir, g_dc_ir, g_ac_amp);
-    }
-
-    bsp_display_lock(0);
-    lv_label_set_text(lbl, buf);
-    bsp_display_unlock();
-}
-
-
 /* =============================
  *  Public: Read-now trigger (UI button calls this)
  * ============================= */
@@ -348,46 +338,32 @@ static void max_task(void *arg)
     TickType_t last_run_start = xTaskGetTickCount();
 
     while (1) {
-        TickType_t period_ticks = 0;
-        TickType_t run_ticks = 0;
+         // OFF/manual mode: wait here until user taps "Read Now"
+    if (g_hr_period_ms == 0 || g_hr_run_ms == 0) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    } else {
+        // Scheduled mode: wait until next period OR read-now notify
+        TickType_t period_ticks = pdMS_TO_TICKS(g_hr_period_ms);
 
-        if (g_hr_period_ms == 0 || g_hr_run_ms == 0) {
-            // OFF: wait until user taps Read Now
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        TickType_t now = xTaskGetTickCount();
+        TickType_t next_due = last_run_start + period_ticks;
+        TickType_t wait_ticks = (next_due > now) ? (next_due - now) : 0;
 
-            // manual run uses g_hr_run_ms if set, otherwise 10s
-            run_ticks = pdMS_TO_TICKS(g_hr_run_ms ? g_hr_run_ms : (10 * 1000));
-            period_ticks = pdMS_TO_TICKS(60 * 1000); // unused in this path
-        } else {
-            period_ticks = pdMS_TO_TICKS(g_hr_period_ms);
-            run_ticks    = pdMS_TO_TICKS(g_hr_run_ms);
-        }
+        while (wait_ticks > 0) {
+            TickType_t chunk = (wait_ticks > idle_poll) ? idle_poll : wait_ticks;
 
-        // ---------- IDLE: wait for next scheduled run OR read-now ----------
-        if (period_ticks != 0) {
-            // ---------- IDLE: wait for next scheduled run OR Read Now ----------
-            TickType_t now = xTaskGetTickCount();
-            TickType_t next_due = last_run_start + period_ticks;
-            TickType_t wait_ticks = (next_due > now) ? (next_due - now) : 0;
-
-            while (wait_ticks > 0) {
-                TickType_t chunk = (wait_ticks > idle_poll) ? idle_poll : wait_ticks;
-
-                // If notified => run immediately
-                if (ulTaskNotifyTake(pdTRUE, chunk) > 0) {
-                    ESP_LOGI(HR_TAG, "Read-now requested");
-                    break;
-                }
-
-                now = xTaskGetTickCount();
-                next_due = last_run_start + period_ticks;
-                wait_ticks = (next_due > now) ? (next_due - now) : 0;
+            if (ulTaskNotifyTake(pdTRUE, chunk) > 0) {
+                ESP_LOGI(HR_TAG, "Read-now requested (scheduled mode)");
+                break;
             }
 
-            // Start window now (either scheduled or manual)
-            last_run_start = xTaskGetTickCount();
+            now = xTaskGetTickCount();
+            next_due = last_run_start + period_ticks;
+            wait_ticks = (next_due > now) ? (next_due - now) : 0;
         }
 
+        last_run_start = xTaskGetTickCount();
+    }
         // ---------- START WINDOW ----------
         err = max30102_init();
         if (err != ESP_OK) {
@@ -424,94 +400,117 @@ static void max_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(20));
         }
 
-        uint32_t ir0 = (good > 0) ? (ir_sum / good) : g_ir;
+        uint32_t ir0 = (good > 0) ? (ir_sum / good) : (HR_DC_MIN + 1000);
         ppg_filter_reset(&filt, (float)ir0);
 
-        TickType_t window_start = xTaskGetTickCount();
-        TickType_t next_ui = window_start; // UI update cadence
-
-        uint32_t last_raw_log_ms = 0;
         // uint32_t next_log_ms = esp_log_timestamp();
 
-        while ((xTaskGetTickCount() - window_start) < run_ticks) {
+        // session knobs
+        const uint32_t stabilize_need_ms = 2000; // 2s stable before measuring
+        const uint32_t session_total_ms  = (g_hr_run_ms ? g_hr_run_ms : 15000);
 
+        uint32_t good_ms = 0;
+        bool measuring = false;
+
+        float bpm_samples[32];
+        int bpm_n = 0;
+        uint32_t start_ms = esp_log_timestamp();
+
+        for (;;) {
+            // end conditions:
+            uint32_t now_ms = esp_log_timestamp();
+            uint32_t elapsed_ms = now_ms - start_ms;
+
+            // read sample @ 50Hz
             max30102_sample_t s;
             err = max30102_read_sample(&s);
-
-            if (err == ESP_OK) {
-                g_red = s.red;
-                g_ir  = s.ir;
-                uint32_t now_ms = (uint32_t)esp_log_timestamp();
-
-                // 1) Contact/DC sanity
-                g_dc_ir = filt.dc; // will update after step, but ok
-
-                // 2) Filter step on IR
-                float ac = ppg_filter_step(&filt, (float)g_ir);
-
-                // 3) expose for UI/quality
-                g_dc_ir = filt.dc;
-                g_ac_amp = filt.ac_abs_avg;
-
-                // 4) peak detect / bpm
-                // Only attempt if DC looks like contact
-                bool dc_ok = (filt.dc >= (float)HR_DC_MIN && filt.dc <= (float)HR_DC_MAX);
-                if (dc_ok) {
-                    hr_process_sample(&hr, &filt, ac, now_ms);
-                } else {
-                    hr.bpm_valid = false;
-                }
-
-                // 5) accept BPM only if amplitude is decent + enough time
-                bool amp_ok = (filt.ac_abs_avg >= (float)HR_AC_MIN);
-                g_bpm_valid = (hr.bpm_valid && amp_ok && dc_ok);
-                g_bpm = (g_bpm_valid ? hr.bpm_avg : 0);
-
-                // 6) optional raw logging
-                #if HR_LOG_RAW
-                if ((now_ms - last_raw_log_ms) >= HR_LOG_RAW_EVERY_MS) {
-                    last_raw_log_ms = now_ms;
-                    ESP_LOGI(HR_TAG,
-                    "TUNE ir=%" PRIu32 " dc=%.0f ac=%.1f amp=%.1f bpm_valid=%d bpm=%.1f",
-                    g_ir,
-                    filt.dc,
-                    ac,
-                    filt.ac_abs_avg,
-                    (int)g_bpm_valid,
-                    g_bpm);
-                }
-                
-                #endif
-
-                // UI update ~5 Hz (every 200ms)
-                TickType_t t = xTaskGetTickCount();
-                if (t >= next_ui) {
-                    next_ui = t + pdMS_TO_TICKS(50);
-                    lv_async_call(ui_update_max_async, NULL);
-                }
-
-            } else {
-                // unplugged / bus issue mid-window => mark missing, exit window
+            if (err != ESP_OK) {
                 s_max_present = false;
-
-                uint32_t tms = esp_log_timestamp();
-                if (tms - last_warn_ms > 3000) {
-                    last_warn_ms = tms;
-                    ESP_LOGW(HR_TAG, "read failed: %s (will re-probe next time)", esp_err_to_name(err));
-                }
+                ESP_LOGW(HR_TAG, "read failed: %s", esp_err_to_name(err));
                 break;
             }
 
-            // Internal read rate: 50 Hz (every 20ms)
+            float ac = ppg_filter_step(&filt, (float)s.ir);
+
+            bool dc_ok  = (filt.dc >= HR_DC_MIN && filt.dc <= HR_DC_MAX);
+            bool amp_ok = (filt.ac_abs_avg >= HR_AC_MIN);
+
+            if (dc_ok) hr_process_sample(&hr, &filt, ac, now_ms);
+            else hr.bpm_valid = false;
+
+            bool bpm_ok = hr.bpm_valid;
+            bool signal_ok = (dc_ok && amp_ok);
+
+            // ---- update shared UI status (state + progress) ----
+            portENTER_CRITICAL(&s_ui_mux);
+            s_ui.contact_ok = dc_ok;
+            s_ui.signal_ok  = signal_ok;
+
+            if (!measuring) {
+                // pre-measure phase
+                if (!dc_ok) s_ui.state = HR_STATE_SEEK_CONTACT;
+                else if (!amp_ok) s_ui.state = HR_STATE_STABILIZING;
+                else s_ui.state = HR_STATE_STABILIZING;
+                s_ui.session_ms_total = session_total_ms;
+                s_ui.session_ms_elapsed = 0;
+                s_ui.bpm_valid = false;
+                s_ui.bpm_current = 0;
+            } else {
+                s_ui.state = HR_STATE_MEASURING;
+                s_ui.session_ms_total = session_total_ms;
+                s_ui.session_ms_elapsed = elapsed_ms; // (elapsed since start_ms; see note below)
+                s_ui.bpm_valid = bpm_ok;
+                s_ui.bpm_current = (bpm_ok ? hr.bpm_avg : 0.0f);
+
+            }
+            portEXIT_CRITICAL(&s_ui_mux);
+
+            // ---- stability gate ----
+            if (!measuring) {
+                if (signal_ok) good_ms += 20;
+                else good_ms = 0;
+
+                if (good_ms >= stabilize_need_ms) {
+                    measuring = true;
+                    // reset session clock so progress is “measuring time only”
+                    start_ms = esp_log_timestamp();
+                    elapsed_ms = 0;
+                    bpm_n = 0;
+                }
+            } else {
+                // ---- collect bpm samples during measuring ----
+                if (signal_ok && bpm_ok && bpm_n < (int)(sizeof(bpm_samples)/sizeof(bpm_samples[0]))) {
+                    bpm_samples[bpm_n++] = hr.bpm_avg;
+                }
+
+                // end session
+                if (elapsed_ms >= session_total_ms) {
+                    float bpm_final = (bpm_n >= 5) ? median_f(bpm_samples, bpm_n) : hr.bpm_avg;
+
+                    portENTER_CRITICAL(&s_ui_mux);
+                    s_ui.state = HR_STATE_DONE;
+                    s_ui.bpm_valid = (bpm_final > 0.1f);
+                    s_ui.bpm_current = bpm_final;
+                    if (s_ui.bpm_valid) s_ui.bpm_last = bpm_final;
+                    s_ui.session_ms_elapsed = session_total_ms;
+                    portEXIT_CRITICAL(&s_ui_mux);
+
+                    break;
+                }
+            }
+
+            // UI refresh
+            ui_hr_widget_refresh_request();
+
             vTaskDelay(pdMS_TO_TICKS(20));
         }
-
-        // ---------- END WINDOW: shutdown sensor to save power ----------
+        
+        // END WINDOW: shutdown sensor to save power
         max30102_shutdown_best_effort();
-
         ESP_LOGI(HR_TAG, "HR window complete");
-    }
-}
+    } // ✅ closes while(1)
+}     // ✅ closes max_task()
+
 
 void start_max30102_task(void)
 {

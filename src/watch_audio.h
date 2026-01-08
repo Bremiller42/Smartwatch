@@ -20,6 +20,8 @@ void watch_audio_beep(uint16_t freq_hz, uint16_t duration_ms);
 void watch_audio_set_gain(float gain);
 void watch_audio_beep_async(uint16_t freq, uint16_t ms);
 void watch_audio_beep_async_init(void);
+void watch_audio_sleep_prepare(void);
+void watch_audio_wake_restore(void);
 
 
 #ifdef __cplusplus

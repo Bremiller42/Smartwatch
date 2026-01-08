@@ -90,7 +90,7 @@ extern char g_ble_peer[32];   // if you later want peer name/address
 
 extern lv_timer_t *sleep_timer;
 extern uint32_t g_last_activity_ms;
-extern bool g_screen_awake;
+extern volatile bool g_screen_awake;
 extern lv_timer_t *touch_activity_timer;
 
 extern uint32_t g_ignore_until_ms;
@@ -121,11 +121,13 @@ typedef enum {
     UI_CLOCK = 1,
     UI_SETTINGS = 2,
     UI_BLANK = 3,
+    UI_LOG = 4,
 } ui_screen_t;
 
 extern lv_obj_t *scr_blank;
 extern lv_obj_t *scr_home;
 extern lv_obj_t *scr_clock;
+extern lv_obj_t *scr_log;
 extern lv_obj_t *scr_settings;
 extern lv_obj_t *ble_status_lbl;   // optional
 extern lv_obj_t *clock_notification_icon_box;
@@ -156,3 +158,7 @@ extern volatile bool g_notif_dirty;
 extern lv_obj_t *phone_batt_lbl;
 
 extern int delay_ms; // default 60s
+extern lv_obj_t *watch_batt_lbl;
+extern int  g_phone_batt_pct;        // -1 unknown
+extern bool g_phone_batt_charging;   // true/false
+extern ui_screen_t g_ui_current;

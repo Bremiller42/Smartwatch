@@ -17,6 +17,13 @@
 #pragma once
 #include "esp_lcd_types.h"
 #include "driver/gpio.h"
+#include "esp_err.h"
+#include "esp_lcd_panel_ops.h"
+#include "lvgl.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* LCD color formats */
 #define ESP_LCD_COLOR_FORMAT_RGB565    (1)
@@ -133,7 +140,16 @@ esp_err_t bsp_display_backlight_on(void);
  *      - ESP_ERR_INVALID_ARG   Parameter error
  */
 esp_err_t bsp_display_backlight_off(void);
+// Existing ones you already have
+lv_indev_t *bsp_display_get_input_dev(void);
+esp_lcd_panel_handle_t bsp_display_get_panel(void);
+
+// NEW power control hooks
+void bsp_display_te_pause(void);
+void bsp_display_te_resume(void);
+void bsp_display_panel_on(bool on);
 
 #ifdef __cplusplus
 }
 #endif
+

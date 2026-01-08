@@ -86,6 +86,8 @@ static esp_lcd_touch_handle_t tp = NULL;   // LCD touch handle
 static esp_lcd_panel_handle_t panel_handle = NULL;
 
 static bool i2c_initialized = false;
+static TaskHandle_t s_te_task = NULL;
+static bool s_te_enabled = false;
 
 esp_err_t bsp_i2c_init(void)
 {
@@ -155,7 +157,7 @@ esp_err_t bsp_display_brightness_set(int brightness_percent)
         brightness_percent = 0;
     }
 
-    ESP_LOGI(TAG, "Setting LCD backlight: %d%%", brightness_percent);
+    ESP_LOGD(TAG, "Setting LCD backlight: %d%%", brightness_percent);
     uint32_t duty_cycle = (1023 * brightness_percent) / 100; // LEDC resolution set to 10bits, thus: 100% = 1023
     BSP_ERROR_CHECK_RETURN_ERR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LCD_LEDC_CH, duty_cycle));
     BSP_ERROR_CHECK_RETURN_ERR(ledc_update_duty(LEDC_LOW_SPEED_MODE, LCD_LEDC_CH));
@@ -293,15 +295,25 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
         };
 
         ESP_ERROR_CHECK(gpio_config(&te_detect_cfg));
-        gpio_install_isr_service(0);
+        esp_err_t e = gpio_install_isr_service(0);
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(e);
+
         ESP_ERROR_CHECK(gpio_isr_handler_add(config->tear_cfg.te_gpio_num, bsp_display_tear_interrupt, tear_ctx));
+
 
         BaseType_t res;
         if (config->tear_cfg.task_affinity < 0) {
-            res = xTaskCreate(bsp_display_sync_task, "Tear task", config->tear_cfg.task_stack, tear_ctx, config->tear_cfg.task_priority, NULL);
+            res = xTaskCreate(bsp_display_sync_task, "Tear task",
+                            config->tear_cfg.task_stack, tear_ctx,
+                            config->tear_cfg.task_priority, &s_te_task);
         } else {
-            res = xTaskCreatePinnedToCore(bsp_display_sync_task, "Tear task", config->tear_cfg.task_stack, tear_ctx, config->tear_cfg.task_priority, NULL, config->tear_cfg.task_affinity);
+            res = xTaskCreatePinnedToCore(bsp_display_sync_task, "Tear task",
+                                        config->tear_cfg.task_stack, tear_ctx,
+                                        config->tear_cfg.task_priority, &s_te_task,
+                                        config->tear_cfg.task_affinity);
         }
+        ESP_GOTO_ON_FALSE(res == pdPASS, ESP_FAIL, err, TAG, "Create Sync task fail!");
+        s_te_enabled = true;
         ESP_GOTO_ON_FALSE(res == pdPASS, ESP_FAIL, err, TAG, "Create Sync task fail!");
     }
 
@@ -524,6 +536,25 @@ lv_disp_t *bsp_display_start_with_config(const bsp_display_cfg_t *cfg)
     BSP_NULL_CHECK(disp_indev = bsp_display_indev_init(cfg, disp), NULL);
 
     return disp;
+}
+void bsp_display_te_pause(void)
+{
+    if (!s_te_enabled) return;
+    gpio_intr_disable(EXAMPLE_PIN_NUM_QSPI_TE);
+    if (s_te_task) vTaskSuspend(s_te_task);
+}
+
+void bsp_display_te_resume(void)
+{
+    if (!s_te_enabled) return;
+    if (s_te_task) vTaskResume(s_te_task);
+    gpio_intr_enable(EXAMPLE_PIN_NUM_QSPI_TE);
+}
+
+void bsp_display_panel_on(bool on)
+{
+    if (!panel_handle) return;
+    esp_lcd_panel_disp_on_off(panel_handle, on);
 }
 
 lv_indev_t *bsp_display_get_input_dev(void)

@@ -1,6 +1,5 @@
 #include "watch_time.h"
 #include "watch_globals.h"
-#include "watch_ui.h"     // for ui_update_clock_async
 #include "watch_audio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -9,7 +8,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <stdlib.h>
-
+#include "ui_priv.h"
 /* ---------------- TM_TAG ---------------- */
 const char *TM_TAG = "TIME";
 

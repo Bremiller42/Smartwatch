@@ -1,11 +1,18 @@
 #pragma once
-#include <lvgl.h>
+#include <stdint.h>
+#include "lvgl.h"     // <-- add this
 
-/* init timers + sleep system */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Settings-exposed knobs
+extern uint32_t g_wifi_off_delay_ms;
+
 void sleep_system_init(void);
-
-/* shared activity function used in UI events */
 void mark_user_activity(void);
-
-/* event cb attached to screens */
 void activity_event_cb(lv_event_t *e);
+
+#ifdef __cplusplus
+}
+#endif

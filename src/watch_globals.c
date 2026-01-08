@@ -71,7 +71,6 @@ lv_obj_t *ble_status_lbl = NULL;
 /* ---------------- Sleep / Wake ---------------- */
 lv_timer_t *sleep_timer = NULL;
 uint32_t g_last_activity_ms = 0;
-bool g_screen_awake = true;
 lv_timer_t *touch_activity_timer = NULL;
 
 uint32_t g_ignore_until_ms = 0;
@@ -82,6 +81,7 @@ bool g_blocker_active = false;
 
 uint32_t g_screen_timeout_ms = 15000; // default 15 seconds
 
+volatile bool g_screen_awake = true;
 
 /* ---------------- NVS Settings ---------------- */
 nvs_handle_t g_nvs = 0;
@@ -92,7 +92,7 @@ lv_obj_t *scr_home     = NULL;
 lv_obj_t *scr_clock    = NULL;
 lv_obj_t *scr_settings = NULL;
 lv_obj_t *scr_blank    = NULL;
-
+lv_obj_t *scr_log      = NULL;
 
 uint16_t g_notif_counts[NG_MAX] = {0};
 
@@ -100,5 +100,6 @@ lv_obj_t *notif_icon_row = NULL;
 lv_obj_t *notif_icon_lbl[NG_MAX] = {0};
 lv_obj_t *notif_badge_lbl[NG_MAX] = {0};
 lv_obj_t *badge_outline[NG_MAX] = {0};
-
+lv_obj_t *watch_batt_lbl = NULL;
 volatile bool g_notif_dirty = false;
+ui_screen_t g_ui_current = (ui_screen_t)-1;

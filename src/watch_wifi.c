@@ -1,6 +1,6 @@
 #include "watch_wifi.h"
 #include "watch_globals.h"
-#include "watch_ui.h"
+#include "ui_priv.h"
 #include "watch_time.h"
 #include "watch_settings.h"
 #include "watch_audio.h"

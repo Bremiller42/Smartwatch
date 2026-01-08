@@ -33,6 +33,12 @@ bool ble_ui_take_dirty(void);
  */
 esp_err_t ble_notify_tx(const char *msg);
 
+typedef void (*ble_rx_cb_t)(const char *data, int len);
+
+// NEW: power profiles for connection parameters
+void ble_request_sleep_params(void);
+void ble_request_awake_params(void);
+
 #ifdef __cplusplus
 }
 #endif

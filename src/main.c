@@ -24,9 +24,12 @@
 #include "watch_settings.h"
 #include "watch_sleep.h"
 #include "watch_time.h"
-#include "watch_ui.h"
+#include "ui_priv.h"
 #include "watch_wifi.h"
-
+#include "watch_power.h"
+#include "watch_logbuf.h"
+#include "watch_loghook.h"
+#include "watch_logstream.h"
 static const char *MAIN_TAG = "SmartWatch";
 
 #define LOG_SECTION(section) \
@@ -60,6 +63,7 @@ static void init_logs_and_chipinfo(void)
     ESP_LOGI(MAIN_TAG, "Minimum free heap: %" PRIu32 " bytes", esp_get_minimum_free_heap_size());
     ESP_LOGI(MAIN_TAG, "Free PSRAM: %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
+
 
 static void display_init(void)
 {
@@ -127,6 +131,7 @@ void setup(void)
     // Logging policy: keep INFO globally, but avoid noisy spam in hot paths (BLE RX etc).
     esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set(MAIN_TAG, ESP_LOG_INFO);
+    watch_logstream_init();
 
     // Audio init early (boot sounds + any beeps later)
     watch_audio_init();
@@ -148,9 +153,12 @@ void setup(void)
     LOG_SECTION("Initialize time zone");
     time_set_timezone();
     time_restore_last_known();
-
+    
+    /*-------INITS-------*/
+    watch_power_init();
     display_init();
     ui_init();
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
 
     // Boot chime (keep short)
     watch_audio_beep(880,  60);
@@ -160,7 +168,6 @@ void setup(void)
     LOG_SECTION("Bring up services");
     bringup_services();
 
-    LOG_SECTION("Smartwatch ready");
 }
 
 void loop(void)
