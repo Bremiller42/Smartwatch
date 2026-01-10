@@ -20,7 +20,7 @@
 #include "esp_err.h"
 #include "esp_lcd_panel_ops.h"
 #include "lvgl.h"
-
+#include "esp_lcd_touch.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -148,6 +148,7 @@ esp_lcd_panel_handle_t bsp_display_get_panel(void);
 void bsp_display_te_pause(void);
 void bsp_display_te_resume(void);
 void bsp_display_panel_on(bool on);
+esp_lcd_touch_handle_t bsp_display_get_touch(void);
 
 #ifdef __cplusplus
 }

@@ -1,14 +1,10 @@
 // FILE: watch_ble.c
-// Refactor highlights:
-// - RX chunk logging moved to DEBUG (INFO spam is battery poison)
-// - More conservative buffer handling; avoids repeated strlen work
-// - Snapshot + notif counting behavior preserved
-// - Clears battery ONLY on disconnect (not on connect)
 
 #include "watch_ble.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -23,16 +19,17 @@
 // NimBLE
 #include "nimble/ble.h"
 #include "nimble/nimble_port.h"
-
 #include "nimble/nimble_port_freertos.h"
+
 #include "host/ble_hs.h"
 #include "host/util/util.h"
-#include "services/gap/ble_svc_gap.h"
-#include "services/gatt/ble_svc_gatt.h"
 #include "host/ble_hs_adv.h"
 #include "host/ble_hs_id.h"
 #include "host/ble_sm.h"
+
 #include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
 #include "store/config/ble_store_config.h"
 
 #include "freertos/queue.h"
@@ -42,20 +39,24 @@ static const char *BLE_TAG = "BLE";
 /* ---------------- Internal State ---------------- */
 static ble_rx_cb_t s_on_rx = NULL;
 
-static uint16_t s_conn_handle   = BLE_HS_CONN_HANDLE_NONE;
-static uint16_t s_tx_val_handle = 0;
-static bool     s_notify_enabled = false;
-
-static uint8_t  s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
+static uint16_t s_conn_handle     = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_tx_val_handle   = 0;
+static bool     s_notify_enabled  = false;
+static uint8_t  s_own_addr_type   = BLE_OWN_ADDR_PUBLIC;
 
 static void ble_advertise(void);
 static void ble_stop_adv_only(void);
 
 static volatile bool s_ble_ui_dirty = false;
-static char s_work[1024];
+static volatile bool s_ble_enabled = true;  // mirrors user intent (default on)
 
+/* RX framing */
 static char   s_rx_accum[1024];
 static size_t s_rx_len = 0;
+
+/* Work buffer for tokenization */
+static char s_work[1024];
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -64,8 +65,10 @@ void ble_store_config_init(void);
 }
 #endif
 
+/* ---------------- TX queue (notify from safe context) ---------------- */
 #define BLE_TXQ_DEPTH      16
 #define BLE_TX_MAX_BYTES   256
+
 typedef struct {
     uint16_t conn;
     uint16_t val_handle;
@@ -76,29 +79,6 @@ typedef struct {
 static QueueHandle_t s_txq = NULL;
 static TaskHandle_t  s_tx_task = NULL;
 
-/* ---------------- UUIDs ---------------- */
-static const ble_uuid128_t UUID_SVC_NOTIF = BLE_UUID128_INIT(
-    0x2d,0x1a,0x9b,0x24,0x9c,0xb1,0x4e,0x9c,0x9c,0x1d,0x37,0x3a,0x7e,0x8f,0x4a,0x10);
-
-static const ble_uuid128_t UUID_CHR_RX = BLE_UUID128_INIT(
-    0x2d,0x1a,0x9b,0x24,0x9c,0xb1,0x4e,0x9c,0x9c,0x1d,0x37,0x3a,0x7e,0x8f,0x4a,0x11);
-
-static const ble_uuid128_t UUID_CHR_TX = BLE_UUID128_INIT(
-    0x2d,0x1a,0x9b,0x24,0x9c,0xb1,0x4e,0x9c,0x9c,0x1d,0x37,0x3a,0x7e,0x8f,0x4a,0x12);
-
-/* ---------------- Notification state table ---------------- */
-#define NOTIF_MAX_ITEMS 30
-#define NOTIF_ID_MAX    256
-
-typedef struct {
-    bool used;
-    char id[NOTIF_ID_MAX];
-    notif_type_t group;
-} notif_item_t;
-
-static notif_item_t s_notifs[NOTIF_MAX_ITEMS];
-
-static bool s_notif_snapshot_mode = false;
 static void ble_txq_task(void *arg)
 {
     (void)arg;
@@ -107,7 +87,6 @@ static void ble_txq_task(void *arg)
     for (;;) {
         if (xQueueReceive(s_txq, &it, portMAX_DELAY) == pdTRUE) {
 
-            // connection still valid?
             if (!s_notify_enabled) continue;
             if (it.conn == BLE_HS_CONN_HANDLE_NONE || it.val_handle == 0) continue;
 
@@ -116,8 +95,6 @@ static void ble_txq_task(void *arg)
 
             int rc = ble_gatts_notify_custom(it.conn, it.val_handle, om);
             if (rc != 0) {
-                // om is freed by NimBLE on success; on failure it may not be.
-                // NimBLE convention: if notify fails, free mbuf yourself.
                 os_mbuf_free_chain(om);
             }
         }
@@ -140,9 +117,32 @@ static inline void ble_txq_send_str(const char *s)
     it.data[n] = '\0';
     it.len = (uint16_t)n;
 
-    // Non-blocking. If full, drop.
-    (void)xQueueSend(s_txq, &it, 0);
+    (void)xQueueSend(s_txq, &it, 0); // non-blocking drop if full
 }
+
+/* ---------------- UUIDs ---------------- */
+static const ble_uuid128_t UUID_SVC_NOTIF = BLE_UUID128_INIT(
+    0x2d,0x1a,0x9b,0x24,0x9c,0xb1,0x4e,0x9c,0x9c,0x1d,0x37,0x3a,0x7e,0x8f,0x4a,0x10);
+
+static const ble_uuid128_t UUID_CHR_RX = BLE_UUID128_INIT(
+    0x2d,0x1a,0x9b,0x24,0x9c,0xb1,0x4e,0x9c,0x9c,0x1d,0x37,0x3a,0x7e,0x8f,0x4a,0x11);
+
+static const ble_uuid128_t UUID_CHR_TX = BLE_UUID128_INIT(
+    0x2d,0x1a,0x9b,0x24,0x9c,0xb1,0x4e,0x9c,0x9c,0x1d,0x37,0x3a,0x7e,0x8f,0x4a,0x12);
+
+/* ---------------- Notification state table ---------------- */
+#define NOTIF_MAX_ITEMS 30
+#define NOTIF_ID_MAX    256
+
+typedef struct {
+    bool used;
+    char id[NOTIF_ID_MAX];
+    notif_type_t group;
+} notif_item_t;
+
+static notif_item_t s_notifs[NOTIF_MAX_ITEMS];
+static bool s_notif_snapshot_mode = false;
+
 static int notif_find(const char *id)
 {
     for (int i = 0; i < NOTIF_MAX_ITEMS; i++) {
@@ -193,15 +193,9 @@ static void notif_recalc_counts(void)
 }
 
 /* ---------------- Small UI helpers ---------------- */
-static void ble_ui_mark_dirty(void)
-{
-    s_ble_ui_dirty = true;
-}
+static void ble_ui_mark_dirty(void) { s_ble_ui_dirty = true; }
 
-void ble_ui_mark_dirty_from_ble_thread(void)
-{
-    s_ble_ui_dirty = true;
-}
+void ble_ui_mark_dirty_from_ble_thread(void) { s_ble_ui_dirty = true; }
 
 bool ble_ui_take_dirty(void)
 {
@@ -209,6 +203,8 @@ bool ble_ui_take_dirty(void)
     s_ble_ui_dirty = false;
     return true;
 }
+
+/* ---------------- Store status (bonding) ---------------- */
 static int ble_store_status_cb(struct ble_store_status_event *event, void *arg)
 {
     (void)event;
@@ -225,7 +221,6 @@ static notif_type_t notif_group_from_pkg_and_type(const char *type, const char *
         if (strstr(pkg, "com.facebook.orca"))          return NG_MESSENGER;
         if (strstr(pkg, "discord"))                    return NG_DISCORD;
         if (strstr(pkg, "amazon"))                     return NG_AMAZON;
-
         if (strstr(pkg, "com.textra"))                 return NG_SMS;
         if (strstr(pkg, "googlequicksearchbox"))       return NG_WEATHER;
     }
@@ -266,6 +261,7 @@ static bool parse_batt_frame(const char *frame)
 
     return false;
 }
+
 static void log_conn_security(uint16_t conn_handle)
 {
     struct ble_gap_conn_desc desc;
@@ -294,17 +290,15 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    static char chunk[256];
+    char chunk[256];
     int chunk_len = OS_MBUF_PKTLEN(ctxt->om);
     if (chunk_len <= 0) return 0;
-
     if (chunk_len >= (int)sizeof(chunk)) chunk_len = (int)sizeof(chunk) - 1;
 
     int rc = ble_hs_mbuf_to_flat(ctxt->om, chunk, chunk_len, NULL);
     if (rc != 0) return BLE_ATT_ERR_UNLIKELY;
 
     chunk[chunk_len] = '\0';
-    // ESP_LOGI(BLE_TAG, "RX chunk (%d): %s", chunk_len, chunk);
 
     // Overflow protection
     if (s_rx_len + (size_t)chunk_len >= sizeof(s_rx_accum)) {
@@ -323,6 +317,7 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         for (size_t i = 0; i < s_rx_len; i++) if (s_rx_accum[i] == '|') pipes++;
         if (pipes >= 5) {
             if (parse_batt_frame(s_rx_accum)) {
+                if (s_on_rx) s_on_rx(s_rx_accum, (int)strlen(s_rx_accum));
                 s_rx_len = 0;
                 s_rx_accum[0] = '\0';
             }
@@ -350,7 +345,6 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
             // Notification frames
             else if (frame[0] == 'N' && frame[1] == '|') {
 
-                // static char work[1024];
                 size_t wlen = strlen(frame);
                 if (wlen >= sizeof(s_work)) wlen = sizeof(s_work) - 1;
                 memcpy(s_work, frame, wlen);
@@ -358,7 +352,7 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
                 char *save = NULL;
                 (void)strtok_r(s_work, "|", &save);        // N
-                char *cmd = strtok_r(NULL, "|", &save);  // U/D/S/E or old TYPE
+                char *cmd = strtok_r(NULL, "|", &save);    // U/D/S/E or old TYPE
 
                 if (cmd) {
                     if (!strcmp(cmd, "S")) {
@@ -408,8 +402,8 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                     }
                     else {
                         // Backward compat: N|TYPE|PKG|Title|Body
-                        char *type  = cmd;
-                        char *pkg   = strtok_r(NULL, "|", &save);
+                        char *type = cmd;
+                        char *pkg  = strtok_r(NULL, "|", &save);
                         (void)strtok_r(NULL, "|", &save);
                         (void)strtok_r(NULL, "|", &save);
 
@@ -420,7 +414,6 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
                 if (s_on_rx) s_on_rx(frame, (int)strlen(frame));
             }
-            // Anything else
             else {
                 if (s_on_rx) s_on_rx(frame, (int)strlen(frame));
             }
@@ -432,10 +425,10 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         s_rx_len -= consumed;
         s_rx_accum[s_rx_len] = '\0';
     }
-        // Optional ACK (deferred; do NOT notify inside access callback)
+
+    // Optional ACK (queue-based; safe)
     ble_txq_send_str("OK");
 
-    // ui_notif_refresh_async();
     return 0;
 }
 
@@ -464,19 +457,17 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
             {
                 .uuid      = &UUID_CHR_RX.u,
                 .access_cb = gatt_chr_rx_access_cb,
-                .flags     = BLE_GATT_CHR_F_WRITE 
-                | BLE_GATT_CHR_F_WRITE_NO_RSP 
-                | BLE_GATT_CHR_F_WRITE_ENC
-                ,
+                .flags     = BLE_GATT_CHR_F_WRITE
+                           | BLE_GATT_CHR_F_WRITE_NO_RSP
+                           | BLE_GATT_CHR_F_WRITE_ENC,
             },
             {
                 .uuid       = &UUID_CHR_TX.u,
                 .access_cb  = gatt_chr_tx_access_cb,
                 .val_handle = &s_tx_val_handle,
-                .flags      = BLE_GATT_CHR_F_NOTIFY 
-                | BLE_GATT_CHR_F_READ 
-                | BLE_GATT_CHR_F_READ_ENC
-                ,
+                .flags      = BLE_GATT_CHR_F_NOTIFY
+                           | BLE_GATT_CHR_F_READ
+                           | BLE_GATT_CHR_F_READ_ENC,
             },
             { 0 }
         },
@@ -492,59 +483,64 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     switch (event->type) {
 
         case BLE_GAP_EVENT_CONNECT:
+            ESP_LOGI(BLE_TAG, "CONNECT status=%d", event->connect.status);
+
             if (event->connect.status == 0) {
                 s_rx_len = 0;
                 s_rx_accum[0] = '\0';
 
                 s_conn_handle = event->connect.conn_handle;
                 g_ble_connected = true;
+
+                // Try to initiate encryption if not already encrypted
                 struct ble_gap_conn_desc d;
                 if (ble_gap_conn_find(s_conn_handle, &d) == 0) {
                     if (!d.sec_state.encrypted) {
                         int rc = ble_gap_security_initiate(s_conn_handle);
-                        ESP_LOGI(BLE_TAG, "security_initiate rc=%d", rc);    
+                        ESP_LOGI(BLE_TAG, "security_initiate rc=%d", rc);
                     }
                 }
 
-                // Clear notifications only (battery persists until phone sends it)
+                // Clear notifications (battery persists until phone sends)
                 notif_clear_all_local();
                 s_notif_snapshot_mode = false;
 
                 watch_audio_beep_async(1900, 80);
                 ble_ui_mark_dirty();
-
             } else {
                 s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
                 s_notify_enabled = false;
                 g_ble_connected = false;
 
                 ble_ui_mark_dirty();
-                ble_advertise();
+                if (s_ble_enabled) ble_advertise();
             }
-            ESP_LOGI(BLE_TAG, "State: Connect");
 
             return 0;
 
         case BLE_GAP_EVENT_DISCONNECT:
-            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            s_notify_enabled = false;
-            g_ble_connected = false;
+        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        s_notify_enabled = false;
+        g_ble_connected = false;
 
-            notif_clear_all_local();
-            phone_batt_clear_local();
-            s_notif_snapshot_mode = false;
+        notif_clear_all_local();
+        phone_batt_clear_local();
+        s_notif_snapshot_mode = false;
 
-            watch_audio_beep_async(1400, 60);
+        watch_audio_beep_async(1400, 60);
 
-            s_rx_len = 0;
-            s_rx_accum[0] = '\0';
+        s_rx_len = 0;
+        s_rx_accum[0] = '\0';
 
-            ble_ui_mark_dirty();
+        ble_ui_mark_dirty();
+        if (s_ble_enabled) {
             ble_advertise();
-            ESP_LOGI(BLE_TAG, "State: Disconnect");
-            if (s_txq) xQueueReset(s_txq);
+        }
+        ESP_LOGI(BLE_TAG, "State: Disconnect, Reason=%d",
+                 event->disconnect.reason);
+        if (s_txq) xQueueReset(s_txq);
+        return 0;
 
-            return 0;
 
         case BLE_GAP_EVENT_SUBSCRIBE:
             if (event->subscribe.attr_handle == s_tx_val_handle) {
@@ -554,14 +550,13 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             return 0;
 
         case BLE_GAP_EVENT_ADV_COMPLETE:
-            ble_advertise();
-            ESP_LOGI(BLE_TAG, "State: ADV Complete");
+        if (s_ble_enabled) ble_advertise();
+        ESP_LOGI(BLE_TAG, "State: ADV Complete");
+        return 0;
 
-            return 0;
 
         case BLE_GAP_EVENT_PASSKEY_ACTION:
-            // If you ever switch to passkey/Numeric Comparison, handle here.
-            ESP_LOGI(BLE_TAG, "PASSKEY_ACTION event (io=%d)", ble_hs_cfg.sm_io_cap);
+            ESP_LOGI(BLE_TAG, "PASSKEY_ACTION (io=%d)", ble_hs_cfg.sm_io_cap);
             return 0;
 
         case BLE_GAP_EVENT_ENC_CHANGE:
@@ -571,25 +566,26 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             }
             return 0;
 
-
         case BLE_GAP_EVENT_REPEAT_PAIRING:
-            // If a phone tries to pair again, allow it cleanly.
-            // Returning BLE_GAP_REPEAT_PAIRING_RETRY lets it re-pair.
             return BLE_GAP_REPEAT_PAIRING_RETRY;
 
         default:
             return 0;
     }
 }
+
+/* ---------------- Connection parameter profiles ---------------- */
 void ble_request_sleep_params(void)
 {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
     struct ble_gap_upd_params p = {0};
     // Lower power while screen off:
-    p.itvl_min = 96;    // 120ms
-    p.itvl_max = 128;   // 160ms
-    p.latency  = 6;     // skip a few intervals
+    // interval units = 1.25ms
+    p.itvl_min = 96;   // 120ms
+    p.itvl_max = 128;  // 160ms
+    p.latency  = 5;
+    // supervision_timeout units = 10ms
     p.supervision_timeout = 500; // 5s
 
     int rc = ble_gap_update_params(s_conn_handle, &p);
@@ -601,11 +597,10 @@ void ble_request_awake_params(void)
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
     struct ble_gap_upd_params p = {0};
-    // Snappy UI responsiveness while screen on:
     p.itvl_min = 24;   // 30ms
     p.itvl_max = 40;   // 50ms
     p.latency  = 0;
-    p.supervision_timeout = 400; // 4s
+    p.supervision_timeout = 6000; // 60s
 
     int rc = ble_gap_update_params(s_conn_handle, &p);
     ESP_LOGI(BLE_TAG, "BLE params -> AWAKE rc=%d", rc);
@@ -638,8 +633,9 @@ static void ble_advertise(void)
 
     adv_fields.tx_pwr_lvl_is_present = 1;
     adv_fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+
     adv_fields.appearance_is_present = 1;
-    adv_fields.appearance = 0x0341; // "Generic Watch" (common choice)
+    adv_fields.appearance = 0x0341; // Generic Watch
 
     int rc = ble_gap_adv_set_fields(&adv_fields);
     if (rc != 0) {
@@ -660,11 +656,13 @@ static void ble_advertise(void)
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    // Keep your intervals; if you want battery savings later, we can widen these when screen is asleep
+    // intervals units = 0.625ms
     adv_params.itvl_min = 0x0030; // 30ms
     adv_params.itvl_max = 0x0060; // 60ms
 
-    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, gap_event_cb, NULL);
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
+                           &adv_params, gap_event_cb, NULL);
+
     if (rc != 0) {
         ESP_LOGE(BLE_TAG, "ble_gap_adv_start rc=%d (addr_type=%u)", rc, (unsigned)s_own_addr_type);
     } else {
@@ -683,8 +681,15 @@ static void on_sync(void)
                      rc, (unsigned)s_own_addr_type);
         }
     }
-    ble_advertise();
+
+    // Only advertise if user intent says BLE is enabled
+    if (s_ble_enabled) {
+        ble_advertise();
+    } else {
+        ble_stop_adv_only();
+    }
 }
+
 
 static void host_task(void *param)
 {
@@ -697,9 +702,11 @@ static void host_task(void *param)
 esp_err_t ble_init(ble_rx_cb_t on_rx)
 {
     s_on_rx = on_rx;
+    // Mirror user setting (Settings owns g_ble_on)
+    extern bool g_ble_on;
+    s_ble_enabled = g_ble_on;
 
-    // --- NVS must be ready for bonding key storage ---
-    // If you're already doing this earlier, this will just return ESP_OK.
+    // NVS required for bonding storage
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -712,6 +719,7 @@ esp_err_t ble_init(ble_rx_cb_t on_rx)
 
     nimble_port_init();
     ble_store_config_init();
+
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ble_svc_gap_device_name_set("NoesisWatch");
@@ -723,20 +731,17 @@ esp_err_t ble_init(ble_rx_cb_t on_rx)
     if (rc != 0) return ESP_FAIL;
 
     ble_hs_cfg.sync_cb = on_sync;
-    // --- Security / Bonding ---
-    ble_hs_cfg.store_status_cb = ble_store_status_cb;
 
-    // Security Manager (pairing/bonding) config
+    // Security / bonding
+    ble_hs_cfg.store_status_cb = ble_store_status_cb;
     ble_hs_cfg.sm_bonding = 1;
-    ble_hs_cfg.sm_mitm = 0;          // "Just Works"
-    ble_hs_cfg.sm_sc = 1;            // LE Secure Connections if possible
-    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_mitm = 0; // Just Works
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-
-    // NoInputNoOutput = Just Works
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
-    ble_hs_cfg.store_status_cb = ble_store_status_cb;
-    // TX queue/task (send notifications from a safe context)
+
+    // TX queue/task
     if (!s_txq) {
         s_txq = xQueueCreate(BLE_TXQ_DEPTH, sizeof(ble_tx_item_t));
     }
@@ -752,13 +757,18 @@ esp_err_t ble_init(ble_rx_cb_t on_rx)
 
 void ble_start(void)
 {
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) ble_advertise();
+    if (!s_ble_enabled) return;
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        ble_advertise();
+    }
 }
 
 void ble_stop(void)
 {
+    // Stop advertising
     ble_stop_adv_only();
 
+    // Disconnect if connected
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -767,8 +777,14 @@ void ble_stop(void)
     s_notify_enabled = false;
     g_ble_connected = false;
 
+    // Optional but consistent: clear phone batt/notifications on explicit stop
+    notif_clear_all_local();
+    phone_batt_clear_local();
+    s_notif_snapshot_mode = false;
+
     ble_ui_mark_dirty();
 }
+
 
 bool ble_is_connected(void)
 {
@@ -797,4 +813,22 @@ esp_err_t ble_notify_tx(const char *msg)
     }
     return ESP_OK;
 }
+void ble_set_enabled(bool on)
+{
+    s_ble_enabled = on;
 
+    if (on) {
+        // Respect init state: if NimBLE isn't ready yet, ble_start() will safely advertise when possible.
+        ble_start();
+    } else {
+        // Hard stop: stop advertising and disconnect if connected.
+        ble_stop();
+    }
+
+    ble_ui_mark_dirty();
+}
+
+bool ble_is_enabled(void)
+{
+    return s_ble_enabled;
+}

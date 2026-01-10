@@ -178,16 +178,9 @@ static void on_ble_toggle(lv_event_t *e)
     g_ble_on = on;
     settings_save_ble(on);
 
-    if (on) {
-        ESP_LOGI(UI_SS_TAG, "BLE toggle ON -> start advertising");
-        ble_start();
-    } else {
-        ESP_LOGI(UI_SS_TAG, "BLE toggle OFF -> stop");
-        ble_stop();
-        g_ble_connected = false;
-        lv_async_call(ui_update_ble_status_async, NULL);
-    }
+    ble_set_enabled(on);
 
+    // UI refresh
     lv_async_call(ui_update_ble_icon_async, NULL);
     lv_async_call(ui_update_ble_status_async, NULL);
 

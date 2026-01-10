@@ -8,36 +8,24 @@ extern "C" {
 
 typedef void (*ble_rx_cb_t)(const char *msg, int len);
 
-/**
- * Init BLE + start advertising.
- * Safe to call once at boot.
- */
 esp_err_t ble_init(ble_rx_cb_t on_rx);
 
-/** Start advertising (if stopped) */
 void ble_start(void);
-
-/** Stop advertising + disconnect if connected */
 void ble_stop(void);
 
-/** True if we currently have a BLE connection */
 bool ble_is_connected(void);
 
 void ble_ui_mark_dirty_from_ble_thread(void);
 bool ble_ui_take_dirty(void);
 
-
-/**
- * Optional: send a notify out on TX characteristic (if phone subscribed).
- * Returns ESP_OK if queued, otherwise error.
- */
 esp_err_t ble_notify_tx(const char *msg);
 
-typedef void (*ble_rx_cb_t)(const char *data, int len);
-
-// NEW: power profiles for connection parameters
 void ble_request_sleep_params(void);
 void ble_request_awake_params(void);
+
+/* NEW: explicit enable/disable API (user intent) */
+void ble_set_enabled(bool on);
+bool ble_is_enabled(void);
 
 #ifdef __cplusplus
 }

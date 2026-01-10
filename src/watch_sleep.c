@@ -1,325 +1,283 @@
+// FILE: watch_sleep.c
+
 #include "watch_sleep.h"
 
-#include "display.h"
-#include "lv_port.h"
-#include "esp_bsp.h"
-
-#include "esp_sleep.h"
+#include <stdbool.h>
+#include <string.h>
 #include "esp_log.h"
-#include "driver/gpio.h"
 #include "esp_timer.h"
 
-#include "watch_audio.h"
+#include "watch_globals.h"   // g_last_activity_ms, g_screen_awake, g_ignore_until_ms, etc.
+#include "ui_priv.h"         // ui_show(UI_BLANK), UI_CLOCK, etc.
 #include "watch_power.h"
 #include "watch_wifi.h"
 #include "watch_ble.h"
-#include "watch_globals.h"
-#include "ui_priv.h"
+#include "display.h"
+#include "esp_lcd_touch.h"   // esp_lcd_touch_*
+#include "esp_bsp.h"
 
-/* LVGL internal read (your project used this symbol) */
-void _lv_indev_read(lv_indev_t * indev, lv_indev_data_t * data);
+static const char *TAG = "SLEEP_MGR";
 
-static const char *SLP_TAG = "SLEEP";
-static const char *PWR_TAG = "PWR";
+/* Defaults (ms) — override from Settings */
+uint32_t g_wifi_off_delay_ms = 2 * 60 * 1000;
+uint32_t g_ble_slow_delay_ms = 3 * 60 * 1000;
+uint32_t g_ble_off_delay_ms  = 8 * 60 * 1000;
 
-uint32_t g_wifi_off_delay_ms = (2 * 60 * 1000);
 
-static lv_timer_t *wifi_off_timer = NULL;
-static uint32_t g_wifi_off_deadline_ms = 0;
-static bool g_wifi_forced_off_by_sleep = false;
+/* Internals */
+static lv_timer_t *s_mgr_timer = NULL;
 
-extern int g_brightness;
+static volatile bool s_touch_pending = false;
+static uint32_t s_last_touch_read_ms  = 0;
+static uint32_t s_last_listen_poll_ms = 0;
+static esp_lcd_touch_handle_t s_tp = NULL;
 
-#define WAKE_DEBOUNCE_MS 250
+/* Forced-off tracking (THIS is policy-state, not user intent) */
+static bool s_wifi_forced_off = false;
+static bool s_ble_forced_off  = false;
 
-#ifndef TOUCH_INT_GPIO
-#define TOUCH_INT_GPIO 3
-#endif
-
-#define TOUCH_INT_ACTIVE_LOW 1
-
-// Re-enable the polling timer (like your original working version)
-
-static inline uint32_t now_ms(void) {
+static inline uint32_t now_ms(void)
+{
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-static inline bool touch_int_asserted(void)
+/* ---------- Touch ISR ---------- */
+static void tp_isr_cb(esp_lcd_touch_handle_t tp)
 {
-#if TOUCH_INT_ACTIVE_LOW
-    return gpio_get_level(TOUCH_INT_GPIO) == 0;
-#else
-    return gpio_get_level(TOUCH_INT_GPIO) == 1;
-#endif
+    (void)tp;
+    s_touch_pending = true;
 }
 
-static inline bool wake_debounce_done(void)
+/* ---------- Screen actions (sleep mgr is the only place that touches these) ---------- */
+static void screen_sleep_local(void)
 {
-    return (int32_t)(now_ms() - g_ignore_until_ms) >= 0;
+    if (!g_screen_awake) return;
+
+    g_screen_awake = false;
+    ui_show(UI_BLANK);
+    bsp_display_backlight_off();
+    ESP_LOGI(TAG, "Screen -> OFF");
 }
 
-/* forward decls */
-static void wake_blocker_event_cb(lv_event_t *e);
-static void wake_blocker_create(void);
-static void wake_blocker_remove(void);
-
-static void screen_sleep(void);
-static void screen_wake(void);
-
-static void sleep_timer_cb(lv_timer_t *t);
-static void wifi_off_timer_cb(lv_timer_t *t);
-static void touch_activity_timer_cb(lv_timer_t *t);
-
-static void arm_gpio_wakeup(void)
+static void screen_wake_local(void)
 {
-    // gpio_config_t io = {
-    //     .pin_bit_mask = 1ULL << TOUCH_INT_GPIO,
-    //     .mode = GPIO_MODE_INPUT,
-    //     .pull_up_en = GPIO_PULLUP_ENABLE,
-    //     .pull_down_en = GPIO_PULLDOWN_DISABLE,
-    //     .intr_type = GPIO_INTR_DISABLE,
-    // };
-    // ESP_ERROR_CHECK(gpio_config(&io));
+    if (g_screen_awake) return;
 
-    ESP_ERROR_CHECK(gpio_wakeup_enable((gpio_num_t)TOUCH_INT_GPIO,
-#if TOUCH_INT_ACTIVE_LOW
-                                       GPIO_INTR_LOW_LEVEL
-#else
-                                       GPIO_INTR_HIGH_LEVEL
-#endif
-    ));
-    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+    g_screen_awake = true;
 
-    ESP_LOGI(SLP_TAG, "GPIO wake armed on pin=%d (level=%s)",
-             TOUCH_INT_GPIO,
-#if TOUCH_INT_ACTIVE_LOW
-             "LOW"
-#else
-             "HIGH"
-#endif
-    );
+    // Your wake landing screen
+    ui_show(UI_CLOCK);
+    apply_backlight_percent(g_brightness);
+    ESP_LOGI(TAG, "Screen -> ON");
 }
 
-static void light_sleep_until_touch(void)
+/* Touch polling cadence by stage */
+static uint32_t poll_period_for_stage(sleep_stage_t st)
 {
-    arm_gpio_wakeup();
-
-    // If finger already down, don't sleep.
-    if (touch_int_asserted()) return;
-
-    ESP_LOGI(SLP_TAG, "entering light sleep...");
-    esp_err_t err = esp_light_sleep_start();
-    if (err != ESP_OK) {
-        ESP_LOGW(PWR_TAG, "esp_light_sleep_start err=%s", esp_err_to_name(err));
+    switch (st) {
+        case SLP_AWAKE:      return 20;
+        case SLP_SCREEN_OFF: return 120;
+        case SLP_WIFI_OFF:   return 250;
+        case SLP_BLE_SLOW:   return 400;
+        case SLP_BLE_OFF:    return 800;
+        default:             return 250;
     }
 }
 
-static void wifi_off_timer_cb(lv_timer_t *t)
+/* ---------- Radio restore helpers (only restore what *we* forced off) ---------- */
+static void maybe_restore_wifi(void)
 {
-    (void)t;
+    if (!s_wifi_forced_off) return;
+    s_wifi_forced_off = false;
 
-    if (g_screen_awake) return;
+    // Only restore if user still wants WiFi ON
     if (!g_wifi_on) return;
 
-    uint32_t now = now_ms();
-    if ((int32_t)(now - g_wifi_off_deadline_ms) < 0) return;
+    // Only restore if we have creds
+    if (g_wifi_ssid[0] == '\0') return;
 
-    ESP_LOGI(PWR_TAG, "Screen off grace expired -> Wi-Fi OFF");
-    wifi_stop();
-    g_wifi_forced_off_by_sleep = true;
+    // Bring stack up and connect
+    wifi_ensure_started();
+    (void)wifi_start_sta(g_wifi_ssid, g_wifi_pass);
 
-    if (wifi_off_timer) lv_timer_pause(wifi_off_timer);
+    ESP_LOGI(TAG, "WiFi -> restore (after forced-off)");
 }
 
-static void screen_sleep(void)
+static void maybe_restore_ble(void)
 {
-    if (!g_screen_awake) return;
-    g_screen_awake = false;
+    if (!s_ble_forced_off) return;
+    s_ble_forced_off = false;
 
-    ui_show(UI_BLANK);
-    ESP_LOGI(SLP_TAG, "Screen -> SLEEP");
+    // Only restore if user still has BLE enabled (owner is BLE module now)
+    if (!ble_is_enabled()) return;
 
-    // Swallow touches while asleep
-    g_blocker_active = true;
-    wake_blocker_create();
-
-    if (sleep_timer) lv_timer_pause(sleep_timer);
-
-    // Slow down the polling while asleep (like your original code)
-    if (touch_activity_timer) lv_timer_set_period(touch_activity_timer, 250);
-
-    // Backlight-only sleep (no LVGL/TE/panel pause)
-    bsp_display_backlight_off();
-    bsp_display_te_pause();
-
-    watch_power_set_profile_sleep();
-    ble_request_sleep_params();
-
-    // Wi-Fi grace
-    g_wifi_forced_off_by_sleep = false;
-    if (g_wifi_on) {
-        g_wifi_off_deadline_ms = now_ms() + g_wifi_off_delay_ms;
-        if (!wifi_off_timer) wifi_off_timer = lv_timer_create(wifi_off_timer_cb, 1000, NULL);
-        else lv_timer_resume(wifi_off_timer);
-    }
-
-    // Sleep until touch INT (or other wake reason)
-    light_sleep_until_touch();
-
-    // We woke -> run wake sequence now
-    screen_wake();
+    ble_start();
+    ESP_LOGI(TAG, "BLE -> restore (after forced-off)");
 }
 
-static void screen_wake(void)
+/* ---------- Stage transitions ---------- */
+static void enter_stage(sleep_stage_t st)
 {
-    if (g_screen_awake) return;
-    g_screen_awake = true;
+    if (g_sleep_stage == st) return;
 
-    // NOTE: If USB logging dies after light sleep, you may not see this log.
-    ESP_LOGI(SLP_TAG, "Screen -> WAKE");
+    ESP_LOGI(TAG, "Stage %d -> %d", (int)g_sleep_stage, (int)st);
+    g_sleep_stage = st;
 
-    watch_power_set_profile_awake();
-    ble_request_awake_params();
+    switch (st) {
 
-    bsp_display_te_resume();
-    // Restore backlight
-    apply_backlight_percent(g_brightness);
+        case SLP_AWAKE:
+            screen_wake_local();
 
-    // Resume timers
-    if (sleep_timer) lv_timer_resume(sleep_timer);
-    if (wifi_off_timer) lv_timer_pause(wifi_off_timer);
+            (void)watch_power_set_profile_awake();
+            ble_request_awake_params();
 
-    // Speed up polling while awake
-    if (touch_activity_timer) lv_timer_set_period(touch_activity_timer, 20);
+            // Restore only what we forced off (and only if user still wants it)
+            maybe_restore_wifi();
+            maybe_restore_ble();
+            break;
 
-    // Debounce / blocker
-    g_last_activity_ms = now_ms();
-    g_ignore_until_ms  = now_ms() + WAKE_DEBOUNCE_MS;
-    g_blocker_active = true;
-    g_require_release_after_wake = true;
-    wake_blocker_create();
+        case SLP_SCREEN_OFF:
+            screen_sleep_local();
+            (void)watch_power_set_profile_sleep();
+            ble_request_sleep_params();
+            break;
 
-    // Switch UI
-    ui_show(UI_CLOCK);
-    ui_notif_refresh_async();
+        case SLP_WIFI_OFF:
+            // Only force WiFi off if user wants it on (otherwise settings already owns it)
+            if (g_wifi_on) {
+                // Don’t spam stop calls; record that this was a policy action
+                if (!s_wifi_forced_off) s_wifi_forced_off = true;
+                wifi_stop();
+                ESP_LOGI(TAG, "WiFi -> OFF (forced by sleep stage)");
+            }
+            break;
 
-    // Wi-Fi reconnect if needed
-    if (g_wifi_on && !g_wifi_connected) {
-        wifi_start_sta(g_wifi_ssid, g_wifi_pass);
+        case SLP_BLE_SLOW:
+            // Only meaningful if connected; function already no-ops if not connected
+            if (ble_is_enabled()) {
+                ble_request_sleep_params();
+            }
+            break;
+
+        case SLP_BLE_OFF:
+            // Only force BLE off if user has BLE enabled.
+            // If user disabled BLE, we should NOT touch it (or mark forced-off).
+            if (ble_is_enabled()) {
+                if (!s_ble_forced_off) s_ble_forced_off = true;
+                ble_stop();
+                ESP_LOGI(TAG, "BLE -> OFF (forced by sleep stage)");
+            }
+            break;
     }
 }
 
-/* ---------------- Wake blocker ---------------- */
-static void wake_blocker_event_cb(lv_event_t *e)
+/* ---------- Touch service (ISR flag + fallback polling) ---------- */
+static void service_touch(uint32_t tnow)
 {
-    // Keep this, but don’t rely on it to unlock anymore.
-    // Unlocking will be handled by touch_activity_timer_cb (more reliable).
-    lv_event_stop_bubbling(e);
-    lv_event_stop_processing(e);
-}
+    if (!s_tp) return;
 
-static void wake_blocker_create(void)
-{
-    if (wake_blocker) return;
+    const uint32_t min_read_gap_ms = 25;
+    bool should_poll = false;
 
-    wake_blocker = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(wake_blocker, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_opa(wake_blocker, LV_OPA_0, 0);
-    lv_obj_set_style_border_opa(wake_blocker, LV_OPA_0, 0);
-    lv_obj_clear_flag(wake_blocker, LV_OBJ_FLAG_SCROLLABLE);
+    if (s_touch_pending) {
+        s_touch_pending = false;
+        should_poll = true;
+    } else {
+        uint32_t period = poll_period_for_stage(g_sleep_stage);
+        if (tnow - s_last_listen_poll_ms >= period) {
+            s_last_listen_poll_ms = tnow;
+            should_poll = true;
+        }
+    }
 
-    lv_obj_add_flag(wake_blocker, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(wake_blocker, wake_blocker_event_cb, LV_EVENT_ALL, NULL);
-}
+    if (!should_poll) return;
+    if (tnow - s_last_touch_read_ms < min_read_gap_ms) return;
+    s_last_touch_read_ms = tnow;
 
-static void wake_blocker_remove(void)
-{
-    if (wake_blocker) {
-        lv_obj_del(wake_blocker);
-        wake_blocker = NULL;
-        ESP_LOGI(SLP_TAG, "Screen -> UNLOCKED");
+    (void)esp_lcd_touch_read_data(s_tp);
+
+    uint16_t x[1] = {0}, y[1] = {0}, s[1] = {0};
+    uint8_t n = 0;
+
+    bool touched = esp_lcd_touch_get_coordinates(s_tp, x, y, s, &n, 1);
+
+    if (touched && n > 0) {
+        g_last_activity_ms = tnow;
+
+        if (g_sleep_stage != SLP_AWAKE) {
+            enter_stage(SLP_AWAKE);
+            g_ignore_until_ms = tnow + 250;
+            g_require_release_after_wake = true;
+        }
     }
 }
 
-/* ---------------- Activity ---------------- */
-void mark_user_activity(void)
-{
-    g_last_activity_ms = now_ms();
-    if (!g_screen_awake) screen_wake();
-}
 
-static void sleep_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    if (!g_screen_awake) return;
-
-    uint32_t now = now_ms();
-    if ((now - g_last_activity_ms) >= g_screen_timeout_ms) {
-        screen_sleep();
-    }
-}
-
-static void touch_activity_timer_cb(lv_timer_t *t)
+/* ---------- LVGL timer callback ---------- */
+static void manager_cb(lv_timer_t *t)
 {
     (void)t;
 
-    lv_indev_t *indev = bsp_display_get_input_dev();
-    if (!indev) return;
+    const uint32_t tnow = now_ms();
+    const uint32_t idle = tnow - g_last_activity_ms;
 
-    lv_indev_data_t data;
-    _lv_indev_read(indev, &data);
-
-    uint32_t now = now_ms();
-
-    // If asleep: any press wakes
-    if (!g_screen_awake) {
-        if (data.state == LV_INDEV_STATE_PRESSED) {
-            mark_user_activity(); // calls screen_wake()
-        }
-        return;
+    // Stage progression
+    if (idle >= g_ble_off_delay_ms) {
+        enter_stage(SLP_BLE_OFF);
+    } else if (idle >= g_ble_slow_delay_ms) {
+        enter_stage(SLP_BLE_SLOW);
+    } else if (idle >= g_wifi_off_delay_ms) {
+        enter_stage(SLP_WIFI_OFF);
+    } else if (idle >= g_screen_timeout_ms) {
+        enter_stage(SLP_SCREEN_OFF);
+    } else {
+        enter_stage(SLP_AWAKE);
     }
 
-    // If within debounce window: keep blocker active
-    if ((int32_t)(now - g_ignore_until_ms) < 0) {
-        g_blocker_active = true;
-        return;
-    }
-
-    // Require release after wake: don’t unlock until we see RELEASED
-    if (g_require_release_after_wake) {
-        g_blocker_active = true;
-        if (data.state == LV_INDEV_STATE_RELEASED) {
-            g_require_release_after_wake = false;
-        }
-        return;
-    }
-    
-    // Unlock after debounce + release
-    g_blocker_active = false;
-    wake_blocker_remove();
-
-    // Normal activity tracking
-    if (data.state == LV_INDEV_STATE_PRESSED) {
-        mark_user_activity();
-    }
+    // Always service touch; stage controls cadence
+    service_touch(tnow);
 }
 
-void activity_event_cb(lv_event_t *e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING ||
-        code == LV_EVENT_CLICKED || code == LV_EVENT_GESTURE) {
-        mark_user_activity();
-    }
-}
-
-void sleep_system_init(void)
+/* ---------- Public API (your project already calls these) ---------- */
+esp_err_t watch_sleep_init(void)
 {
     g_last_activity_ms = now_ms();
-    g_screen_awake = true;
 
-    if (!sleep_timer) sleep_timer = lv_timer_create(sleep_timer_cb, 250, NULL);
+    s_tp = bsp_display_get_touch();
+    if (!s_tp) {
+        ESP_LOGW(TAG, "Touch handle NULL; wake will be polling-only");
+    }
 
-    // Bring back the polling timer that makes wake-blocker reliable
-    if (!touch_activity_timer) touch_activity_timer = lv_timer_create(touch_activity_timer_cb, 20, NULL);
+    if (!s_mgr_timer) {
+        s_mgr_timer = lv_timer_create(manager_cb, 50, NULL);
+    }
+
+    ESP_LOGI(TAG, "Sleep manager init OK");
+    return ESP_OK;
+}
+void IRAM_ATTR watch_sleep_touch_irq_hint_from_isr(void)
+{
+    s_touch_pending = true;
+}
+
+void watch_sleep_notify_activity(void)
+{
+    const uint32_t tnow = now_ms();
+    g_last_activity_ms = tnow;
+
+    if (g_sleep_stage != SLP_AWAKE) {
+        enter_stage(SLP_AWAKE);
+        g_ignore_until_ms = tnow + 250;
+        g_require_release_after_wake = true;
+    }
+}
+
+void watch_sleep_force_awake(void)
+{
+    watch_sleep_notify_activity();
+}
+
+void watch_sleep_force_screen_off(void)
+{
+    enter_stage(SLP_SCREEN_OFF);
 }

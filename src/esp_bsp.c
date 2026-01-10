@@ -24,6 +24,7 @@
 #include "esp_rom_gpio.h"
 #include "esp_lcd_axs15231b.h"
 #include "bsp_err_check.h"
+#include "watch_sleep.h"
 
 #include "lv_port.h"
 #include "display.h"
@@ -110,6 +111,10 @@ esp_err_t bsp_i2c_init(void)
     i2c_initialized = true;
 
     return ESP_OK;
+}
+esp_lcd_touch_handle_t bsp_display_get_touch(void)
+{
+    return tp;
 }
 
 esp_err_t bsp_i2c_deinit(void)
@@ -412,12 +417,17 @@ static void bsp_touch_interrupt_cb(esp_lcd_touch_handle_t tp)
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     bsp_touch_int_t *touch_handle = (bsp_touch_int_t *)tp->config.user_data;
 
+    // existing LVGL wake mechanism:
     xSemaphoreGiveFromISR(touch_handle->tp_intr_event, &xHigherPriorityTaskWoken);
+
+    // NEW: tell sleep manager “touch happened”
+    watch_sleep_touch_irq_hint_from_isr();
 
     if (xHigherPriorityTaskWoken) {
         portYIELD_FROM_ISR();
     }
 }
+
 
 static void bsp_touch_process_points_cb(esp_lcd_touch_handle_t tp, uint16_t *x, uint16_t *y, uint16_t *strength, uint8_t *point_num, uint8_t max_point_num)
 {

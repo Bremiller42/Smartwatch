@@ -145,10 +145,9 @@ void setup(void)
     settings_load_from_nvs();
 
     LOG_SECTION("Initialize BLE");
-    ble_init(NULL);
-    if (g_ble_on) {
-        ble_start();
-    }
+    ESP_ERROR_CHECK(ble_init(NULL));
+    ble_set_enabled(g_ble_on);   // ✅ single source of truth
+
 
     LOG_SECTION("Initialize time zone");
     time_set_timezone();

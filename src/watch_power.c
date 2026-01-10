@@ -25,6 +25,7 @@ esp_err_t watch_power_init(void)
 esp_err_t watch_power_set_profile_awake(void)
 {
 #if CONFIG_PM_ENABLE
+    ESP_LOGI(TAG, "Setting AWAKE power profile");
     esp_pm_config_t pm = {
         .max_freq_mhz = 240,
         .min_freq_mhz = 80,
@@ -39,6 +40,7 @@ esp_err_t watch_power_set_profile_awake(void)
 esp_err_t watch_power_set_profile_sleep(void)
 {
 #if CONFIG_PM_ENABLE
+    ESP_LOGI(TAG, "Setting SLEEP power profile");
     // Aggressive but safe sleep profile:
     esp_pm_config_t pm = {
         .max_freq_mhz = 100,

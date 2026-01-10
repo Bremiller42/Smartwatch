@@ -1,4 +1,5 @@
 #include "watch_globals.h"
+#include "watch_sleep.h"
 
 /* ---------------- TAG ---------------- */
 const char *TAG = "GLOBALS";
@@ -103,3 +104,5 @@ lv_obj_t *badge_outline[NG_MAX] = {0};
 lv_obj_t *watch_batt_lbl = NULL;
 volatile bool g_notif_dirty = false;
 ui_screen_t g_ui_current = (ui_screen_t)-1;
+
+volatile sleep_stage_t g_sleep_stage = SLP_AWAKE;
