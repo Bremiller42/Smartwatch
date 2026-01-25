@@ -213,6 +213,7 @@ void ui_set_watch_batt(int pct, float volts_unused)
     (void)volts_unused;
     s_watch_batt_pct = pct;
     lv_async_call(ui_update_watch_batt_cb, NULL);
+    ESP_LOGI(UI_CLK_TAG, "Watch Batt Set %d%%", s_watch_batt_pct);
 }
 
 void ui_set_watch_batt_async(void *arg)

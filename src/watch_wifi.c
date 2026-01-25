@@ -449,3 +449,22 @@ static void wifi_scan_done_to_ui(void *arg)
 
     free(aprs);
 }
+void watch_wifi_set_enabled(bool en)
+{
+    if (en) {
+        // Respect user toggle
+        if (!g_wifi_on) {
+            ESP_LOGI(WIFI_TAG, "watch_wifi_set_enabled(true) ignored (wifi toggle off)");
+            return;
+        }
+
+        wifi_ensure_started();
+
+        // If we have creds, request connect. Safe if already connected.
+        if (g_wifi_ssid[0] != '\0') {
+            (void)esp_wifi_connect();
+        }
+    } else {
+        wifi_stop();
+    }
+}

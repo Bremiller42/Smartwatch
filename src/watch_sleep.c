@@ -67,6 +67,8 @@ static void screen_wake_local(void)
 
     // Your wake landing screen
     ui_show(UI_CLOCK);
+    ui_notif_refresh_async();
+    
     apply_backlight_percent(g_brightness);
     ESP_LOGI(TAG, "Screen -> ON");
 }

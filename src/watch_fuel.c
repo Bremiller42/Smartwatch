@@ -1,6 +1,7 @@
 #include "watch_fuel.h"
 #include "watch_i2c.h"
 #include "ui_priv.h"
+#include "watch_shutdown.h"
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -124,6 +125,7 @@ static void fg_task(void *arg)
 
             g_watch_batt_pct = pct;
             g_watch_batt_v   = v;
+            watch_shutdown_update(v, g_screen_awake);
 
             int64_t now_ms = esp_timer_get_time() / 1000;
 
@@ -134,6 +136,7 @@ static void fg_task(void *arg)
                 last_pct = pct;
                 last_log_ms = now_ms;
             }
+
 
             if (g_screen_awake) {
                 lv_async_call(ui_set_watch_batt_async, (void*)(intptr_t)g_watch_batt_pct);

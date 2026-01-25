@@ -43,19 +43,15 @@ static void ui_hr_widget_refresh_async(void *arg)
         default:                    lv_label_set_text(hr_status_lbl, "HR: --"); break;
     }
 
-    // BPM + Last
-    if (st.state == HR_STATE_MEASURING || st.state == HR_STATE_DONE) {
+    // BPM (persisted "current" should show whenever valid)
+    if (st.bpm_valid && st.bpm_current > 0.1f) {
         char b[16];
-        snprintf(b, sizeof(b), "%.0f", st.bpm_current > 0 ? st.bpm_current : 0.0f);
-        lv_label_set_text(hr_bpm_lbl, (st.bpm_current > 0) ? b : "--");
+        snprintf(b, sizeof(b), "%.0f", st.bpm_current);
+        lv_label_set_text(hr_bpm_lbl, b);
     } else {
         lv_label_set_text(hr_bpm_lbl, "--");
     }
-
-    char lastb[24];
-    if (st.bpm_last > 0.1f) snprintf(lastb, sizeof(lastb), "Last: %.0f", st.bpm_last);
-    else snprintf(lastb, sizeof(lastb), "Last: --");
-
+    
     // Progress arc
     if (st.state == HR_STATE_MEASURING) {
         lv_obj_clear_flag(hr_prog_arc, LV_OBJ_FLAG_HIDDEN);
@@ -181,12 +177,15 @@ lv_obj_t *ui_build_clock_screen(void)
     lv_obj_add_event_cb(menu, on_back_to_home, LV_EVENT_CLICKED, NULL);
     lv_label_set_text(lv_label_create(menu), LV_SYMBOL_HOME);
     lv_obj_center(lv_obj_get_child(menu, 0));
-
+    
+    ui_set_watch_batt(g_watch_batt_pct, g_watch_batt_v);
     clock_update_label_now();
     clock_update_wifi_icon_now();
     clock_update_ble_icon_now();
     ui_notif_bar_attach(scr);
     ui_hr_widget_refresh_request();
+    ui_set_watch_batt(g_watch_batt_pct, g_watch_batt_v);
+    ui_notif_refresh_async();
 
     if (clock_timer == NULL) {
         clock_timer = lv_timer_create(clock_timer_cb, 1000, NULL);

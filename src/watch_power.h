@@ -8,6 +8,8 @@ extern "C" {
 esp_err_t watch_power_init(void);
 esp_err_t watch_power_set_profile_awake(void);
 esp_err_t watch_power_set_profile_sleep(void);
+void watch_power_shutdown_async(void);
+void watch_power_restart_async(void);
 
 #ifdef __cplusplus
 }

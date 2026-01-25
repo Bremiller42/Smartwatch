@@ -103,3 +103,4 @@ void on_wifi_ap_clicked(lv_event_t *e);
 void ui_hr_widget_refresh_request(void);
 void log_screen_refresh(lv_timer_t *t);
 void ui_log_screen_pause(bool pause);
+lv_obj_t *ui_build_power_menu(void);

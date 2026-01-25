@@ -14,3 +14,6 @@ void settings_load_wifi_creds(void);
 
 void settings_save_screen_timeout_s(uint32_t seconds);
 void settings_save_ble(bool on);
+void settings_save_hr_current(float bpm, bool valid);
+void settings_load_hr_current_into_ui(void);
+void settings_commit_dirty_now(void);

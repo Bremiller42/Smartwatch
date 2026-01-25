@@ -40,3 +40,5 @@
 #include "envelope_regular_full_a8_32.h"
 #include "gear_solid_full_a8_32.h"
 #include "mobile_solid_full_a8_32.h"
+#include "rotate_left_solid_full_a8_50.h"
+#include "power_off_solid_full_a8_50.h"

@@ -94,6 +94,7 @@ lv_obj_t *scr_clock    = NULL;
 lv_obj_t *scr_settings = NULL;
 lv_obj_t *scr_blank    = NULL;
 lv_obj_t *scr_log      = NULL;
+lv_obj_t *scr_power    = NULL;
 
 uint16_t g_notif_counts[NG_MAX] = {0};
 
@@ -106,3 +107,5 @@ volatile bool g_notif_dirty = false;
 ui_screen_t g_ui_current = (ui_screen_t)-1;
 
 volatile sleep_stage_t g_sleep_stage = SLP_AWAKE;
+
+volatile settings_dirty_t g_settings_dirty = {0};

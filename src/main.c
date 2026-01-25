@@ -30,6 +30,8 @@
 #include "watch_logbuf.h"
 #include "watch_loghook.h"
 #include "watch_logstream.h"
+#include "watch_shutdown.h"
+
 static const char *MAIN_TAG = "SmartWatch";
 
 #define LOG_SECTION(section) \
@@ -136,6 +138,7 @@ void setup(void)
     // Audio init early (boot sounds + any beeps later)
     watch_audio_init();
     watch_audio_beep_async_init();
+    watch_shutdown_init();
 
     LOG_SECTION("Smartwatch start");
     init_logs_and_chipinfo();
@@ -158,15 +161,14 @@ void setup(void)
     display_init();
     ui_init();
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
+    settings_load_hr_current_into_ui();
 
+    LOG_SECTION("Bring up services");
+    bringup_services();
     // Boot chime (keep short)
     watch_audio_beep(880,  60);
     watch_audio_beep(1320, 50);
     watch_audio_beep(1760, 70);
-
-    LOG_SECTION("Bring up services");
-    bringup_services();
-
 }
 
 void loop(void)

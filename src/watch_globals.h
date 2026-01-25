@@ -122,6 +122,7 @@ typedef enum {
     UI_SETTINGS = 2,
     UI_BLANK = 3,
     UI_LOG = 4,
+    UI_POWER_MENU = 5,
 } ui_screen_t;
 
 extern lv_obj_t *scr_blank;
@@ -129,6 +130,7 @@ extern lv_obj_t *scr_home;
 extern lv_obj_t *scr_clock;
 extern lv_obj_t *scr_log;
 extern lv_obj_t *scr_settings;
+extern lv_obj_t *scr_power;
 extern lv_obj_t *ble_status_lbl;   // optional
 extern lv_obj_t *clock_notification_icon_box;
 /* ---------------- Rotation ---------------- */
@@ -162,3 +164,17 @@ extern lv_obj_t *watch_batt_lbl;
 extern int  g_phone_batt_pct;        // -1 unknown
 extern bool g_phone_batt_charging;   // true/false
 extern ui_screen_t g_ui_current;
+#define KEY_HR_CUR_BPM_X100   "hr_cur_bpm"     // int32 bpm*100
+#define KEY_HR_CUR_VALID      "hr_cur_valid"   // u8 0/1
+
+typedef struct {
+    bool brightness_dirty;
+    bool wifi_dirty;
+    bool ble_dirty;
+    bool screen_timeout_dirty;
+    bool use24_dirty;
+    bool wifi_creds_dirty;
+    bool hr_dirty;
+} settings_dirty_t;
+
+extern volatile settings_dirty_t g_settings_dirty;

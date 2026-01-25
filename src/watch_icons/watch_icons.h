@@ -53,3 +53,5 @@
 #define icon_envelope_regular               envelope_regular_full_a8_32
 #define icon_gear_solid                     gear_solid_full_a8_32
 #define icon_mobile_solid                   mobile_solid_full_a8_32
+#define icon_rotate_left_solid             rotate_left_solid_full_a8_50
+#define icon_power_off_solid               power_off_solid_full_a8_50

@@ -1,0 +1,182 @@
+#include "watch_shutdown.h"
+
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_sleep.h"
+
+#include "watch_globals.h"
+#include "watch_power.h"
+#include "watch_settings.h"
+
+#include "watch_wifi.h"
+#include "watch_ble.h"
+
+#include "lvgl.h"
+#include "ui_priv.h"
+
+static const char *TAG = "SHDN";
+
+typedef struct {
+    float low_v;
+    float low_exit_v;
+    float critical_v;
+    float critical_exit_v;
+    float shutdown_v;
+    int   shutdown_confirm_ms;
+    int   min_transition_ms;
+    int   dim_pct_low;
+    int   dim_pct_critical;
+} shdn_cfg_t;
+
+static shdn_cfg_t s_cfg = {
+    .low_v = 3.55f,
+    .low_exit_v = 3.62f,
+    .critical_v = 3.40f,
+    .critical_exit_v = 3.47f,
+    .shutdown_v = 3.30f,
+    .shutdown_confirm_ms = 10000,
+    .min_transition_ms = 1500,
+    .dim_pct_low = 35,
+    .dim_pct_critical = 10,
+};
+
+static shdn_state_t s_state = SHDN_OK;
+static int64_t s_below_shutdown_since_ms = -1;
+static int64_t s_last_transition_ms = 0;
+static bool s_actions_applied_low = false;
+static bool s_actions_applied_critical = false;
+
+static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
+static bool can_transition(void) { return (now_ms() - s_last_transition_ms) > s_cfg.min_transition_ms; }
+
+// FIXED: lv_async cb signature is void (*)(void*)
+static void ui_warn_async(void *arg)
+{
+    const char *msg = (const char *)arg;
+    (void)msg;
+    // Optional: display msg somewhere (toast/label). For now, do nothing.
+}
+
+static void apply_low_actions(void)
+{
+    if (s_actions_applied_low) return;
+    s_actions_applied_low = true;
+
+    ESP_LOGW(TAG, "LOW battery actions");
+    apply_backlight_percent(s_cfg.dim_pct_low);
+    (void)watch_power_set_profile_sleep();
+
+    lv_async_call(ui_warn_async, (void*)"LOW BATTERY");
+}
+
+static void apply_critical_actions(void)
+{
+    if (s_actions_applied_critical) return;
+    s_actions_applied_critical = true;
+
+    ESP_LOGE(TAG, "CRITICAL battery actions");
+    apply_backlight_percent(s_cfg.dim_pct_critical);
+    (void)watch_power_set_profile_sleep();
+
+    // Emergency-off radios WITHOUT changing user preference globals
+    ESP_LOGW(TAG, "Emergency disabling Wi-Fi/BLE (critical)");
+    wifi_stop();
+    ble_set_enabled(false);
+
+    lv_async_call(ui_warn_async, (void*)"CRITICAL BATTERY");
+}
+
+static void prepare_for_sleep(void)
+{
+    ESP_LOGW(TAG, "Preparing for deep sleep");
+    // Best effort commit if safe (settings_commit_dirty_now already gates)
+    settings_commit_dirty_now();
+}
+
+static void enter_deep_sleep(void)
+{
+    ESP_LOGW(TAG, "Entering deep sleep due to low VBAT");
+    esp_deep_sleep_start();
+}
+
+esp_err_t watch_shutdown_init(void)
+{
+    s_state = SHDN_OK;
+    s_below_shutdown_since_ms = -1;
+    s_last_transition_ms = 0;
+    s_actions_applied_low = false;
+    s_actions_applied_critical = false;
+    ESP_LOGI(TAG, "Shutdown controller initialized");
+    return ESP_OK;
+}
+
+shdn_state_t watch_shutdown_state(void)
+{
+    return s_state;
+}
+
+void watch_shutdown_update(float vbat, bool screen_awake)
+{
+    (void)screen_awake;
+    if (vbat <= 0.0f) return;
+
+    int64_t t = now_ms();
+
+    if (vbat <= s_cfg.shutdown_v) {
+        if (s_below_shutdown_since_ms < 0) s_below_shutdown_since_ms = t;
+    } else {
+        s_below_shutdown_since_ms = -1;
+    }
+
+    switch (s_state) {
+        case SHDN_OK:
+            if (!can_transition()) break;
+            if (vbat <= s_cfg.critical_v) {
+                s_state = SHDN_CRITICAL;
+                s_last_transition_ms = t;
+                apply_critical_actions();
+            } else if (vbat <= s_cfg.low_v) {
+                s_state = SHDN_LOW;
+                s_last_transition_ms = t;
+                apply_low_actions();
+            }
+            break;
+
+        case SHDN_LOW:
+            if (can_transition() && vbat >= s_cfg.low_exit_v) {
+                ESP_LOGI(TAG, "Battery recovered -> OK");
+                s_state = SHDN_OK;
+                s_last_transition_ms = t;
+                s_actions_applied_low = false;
+                s_actions_applied_critical = false;
+                break;
+            }
+            if (can_transition() && vbat <= s_cfg.critical_v) {
+                s_state = SHDN_CRITICAL;
+                s_last_transition_ms = t;
+                apply_critical_actions();
+            }
+            break;
+
+        case SHDN_CRITICAL:
+            if (can_transition() && vbat >= s_cfg.critical_exit_v) {
+                ESP_LOGI(TAG, "Recovered -> LOW");
+                s_state = SHDN_LOW;
+                s_last_transition_ms = t;
+            }
+
+            if (s_below_shutdown_since_ms > 0 &&
+                (t - s_below_shutdown_since_ms) >= s_cfg.shutdown_confirm_ms)
+            {
+                s_state = SHDN_SHUTTING_DOWN;
+                s_last_transition_ms = t;
+                prepare_for_sleep();
+                enter_deep_sleep();
+            }
+            break;
+
+        case SHDN_SHUTTING_DOWN:
+        default:
+            break;
+    }
+}

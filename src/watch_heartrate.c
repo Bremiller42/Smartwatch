@@ -1,4 +1,4 @@
-// watch_max30102.c
+// watch_heartrate.c
 #include <stdio.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -7,7 +7,7 @@
 #include "esp_log.h"
 #include "esp_bsp.h"
 #include "esp_timer.h"
-
+#include "watch_settings.h"
 #include "lvgl.h"
 #include "watch_i2c.h"
 #include "watch_heartrate.h"
@@ -121,6 +121,15 @@ static float median_f(float *arr, int n)
     return 0.5f * (arr[n/2 - 1] + arr[n/2]);
 }
 
+void hr_set_boot_bpm_current(float bpm, bool valid)
+{
+    portENTER_CRITICAL(&s_ui_mux);
+    s_ui.bpm_current = valid ? bpm : 0.0f;
+    s_ui.bpm_valid   = valid;
+    // keep state idle unless you want it to appear “done”
+    // s_ui.state = valid ? HR_STATE_DONE : HR_STATE_IDLE;
+    portEXIT_CRITICAL(&s_ui_mux);
+}
 
 /* Init/configure sensor; returns:
  * - ESP_OK when initialized
@@ -494,6 +503,8 @@ static void max_task(void *arg)
                     if (s_ui.bpm_valid) s_ui.bpm_last = bpm_final;
                     s_ui.session_ms_elapsed = session_total_ms;
                     portEXIT_CRITICAL(&s_ui_mux);
+                    settings_save_hr_current(bpm_final, (bpm_final > 0.1f));
+
 
                     break;
                 }
