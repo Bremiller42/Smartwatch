@@ -3,10 +3,19 @@
 #include "esp_log.h"
 #include "watch_globals.h"
 #include "watch_fuel.h"
+#include "watch_shutdown.h"
 const char *UI_TAG = "UI";
 
 void ui_show(ui_screen_t s)
 {
+    // Block most transitions while critical/shutting down
+    shdn_state_t st = watch_shutdown_state();
+    if ((st == SHDN_CRITICAL || st == SHDN_SHUTTING_DOWN) &&
+        (s != UI_LOW_PWR && s != UI_BLANK)) {
+        ESP_LOGW(UI_TAG, "UI blocked during CRITICAL (req=%d)", s);
+        s = UI_LOW_PWR;
+    }
+
     ESP_LOGI(UI_TAG, "UI switch to %d", s);
     if (s == g_ui_current) return;
 
@@ -50,7 +59,10 @@ void ui_show(ui_screen_t s)
         if (!scr_blank) scr_blank = ui_build_black_screen();
         lv_scr_load(scr_blank);
     }
-
+    else if (s == UI_LOW_PWR) {
+        if (!scr_low_pwr) scr_low_pwr = ui_build_low_pwr_screen();
+        lv_scr_load(scr_low_pwr);
+    }
     g_ui_current = s;
 }
 

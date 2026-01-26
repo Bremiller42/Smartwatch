@@ -9,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 
 #include "freertos/task.h"
 
@@ -66,6 +67,64 @@ static void init_logs_and_chipinfo(void)
     ESP_LOGI(MAIN_TAG, "Free PSRAM: %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
+static void boot_guard_shutdown_cb(void *arg)
+{
+    (void)arg;
+    watch_power_shutdown_async();
+}
+
+/* returns true if we took over the boot (show low power screen + shutdown) */
+static bool boot_guard_check_and_arm(void)
+{
+    // If you’re using RTC latch:
+    bool latched = watch_shutdown_low_power_latched();
+
+    float vbat = -1.0f;
+    esp_err_t e = watch_fuel_read_vcell(&vbat);
+
+    float crit = watch_shutdown_get_critical_v();  // from watch_shutdown.c API we discussed
+
+    if ((e == ESP_OK && vbat > 0.0f && vbat <= crit) || latched) {
+
+        ESP_LOGW(MAIN_TAG, "BOOT GUARD: vbat=%.2f crit=%.2f latched=%d -> LOW_PWR then sleep",
+                 vbat, crit, (int)latched);
+
+        // keep it visible, but dim
+        g_screen_awake = true;
+        apply_backlight_percent(15);
+
+        // stop radios (optional but recommended)
+        wifi_stop();
+        // ble_set_enabled(false);
+
+        // show the low power screen right now
+        bsp_display_lock(0);
+        ui_show(UI_LOW_PWR);
+        bsp_display_unlock();
+
+        // schedule shutdown in 5 seconds
+        static esp_timer_handle_t t = NULL;
+        if (!t) {
+            const esp_timer_create_args_t ta = {
+                .callback = &boot_guard_shutdown_cb,
+                .name = "boot_guard",
+                .dispatch_method = ESP_TIMER_TASK,
+                .skip_unhandled_events = true,
+            };
+            (void)esp_timer_create(&ta, &t);
+        }
+        if (t) {
+            (void)esp_timer_stop(t);
+            (void)esp_timer_start_once(t, 5 * 1000 * 1000);
+        } else {
+            watch_power_shutdown_async();
+        }
+
+        return true;
+    }
+
+    return false;
+}
 
 static void display_init(void)
 {
@@ -101,18 +160,11 @@ static void ui_init(void)
 
 static void bringup_services(void)
 {
-    LOG_SECTION("Init sleep system");
-    sleep_system_init();
-
     // WiFi autostart (only if enabled AND has SSID)
     if (g_wifi_on && g_wifi_ssid[0]) {
         ESP_LOGI(MAIN_TAG, "Auto WiFi enabled from NVS -> starting STA");
         wifi_start_sta(g_wifi_ssid, g_wifi_pass);
     }
-
-    // I2C MUST be up before any sensor tasks that use it
-    LOG_SECTION("Init I2C");
-    ESP_ERROR_CHECK(watch_i2c_init());
 
     // Start sensor/service tasks AFTER I2C
     start_max30102_task();
@@ -130,15 +182,12 @@ void app_main(void)
 
 void setup(void)
 {
-    // Logging policy: keep INFO globally, but avoid noisy spam in hot paths (BLE RX etc).
     esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set(MAIN_TAG, ESP_LOG_INFO);
     watch_logstream_init();
 
-    // Audio init early (boot sounds + any beeps later)
     watch_audio_init();
     watch_audio_beep_async_init();
-    watch_shutdown_init();
 
     LOG_SECTION("Smartwatch start");
     init_logs_and_chipinfo();
@@ -147,29 +196,51 @@ void setup(void)
     settings_nvs_init();
     settings_load_from_nvs();
 
+    LOG_SECTION("Init power");
+    watch_power_init();
+
+    LOG_SECTION("Init display");
+    display_init();
+
+    LOG_SECTION("Create UI");
+    ui_init();
+
+    LOG_SECTION("Init sleep system");
+    sleep_system_init();
+
+    LOG_SECTION("Init I2C (early)");
+    ESP_ERROR_CHECK(watch_i2c_init());
+
+    LOG_SECTION("Init shutdown controller");
+    watch_shutdown_init();
+
+    // ✅ Optional: probe MAX17048 once (so vcell read is reliable)
+    (void)watch_fuel_init();
+
+    // ✅ BOOT GUARD: if low/latched, show UI_LOW_PWR and schedule shutdown, then STOP boot
+    if (boot_guard_check_and_arm()) {
+        return; // do NOT start BLE/WiFi/tasks; we’re going to deep sleep in 5s
+    }
+
     LOG_SECTION("Initialize BLE");
     ESP_ERROR_CHECK(ble_init(NULL));
-    ble_set_enabled(g_ble_on);   // ✅ single source of truth
-
+    ble_set_enabled(g_ble_on);
 
     LOG_SECTION("Initialize time zone");
     time_set_timezone();
     time_restore_last_known();
-    
-    /*-------INITS-------*/
-    watch_power_init();
-    display_init();
-    ui_init();
+
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
     settings_load_hr_current_into_ui();
 
     LOG_SECTION("Bring up services");
-    bringup_services();
-    // Boot chime (keep short)
+    bringup_services();   // <-- update this to NOT call watch_i2c_init anymore
+
     watch_audio_beep(880,  60);
     watch_audio_beep(1320, 50);
     watch_audio_beep(1760, 70);
 }
+
 
 void loop(void)
 {

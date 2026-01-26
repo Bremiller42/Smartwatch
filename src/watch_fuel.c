@@ -83,13 +83,13 @@ esp_err_t watch_fuel_read_soc(float *pct_out)
 
 esp_err_t watch_fuel_init(void)
 {
-    esp_err_t err = watch_i2c_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(FG_TAG, "I2C init failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    // esp_err_t err = watch_i2c_init();
+    // if (err != ESP_OK) {
+    //     ESP_LOGE(FG_TAG, "I2C init failed: %s", esp_err_to_name(err));
+    //     return err;
+    // }
 
-    err = fg_probe();
+    esp_err_t err = fg_probe();
     if (err != ESP_OK) {
         ESP_LOGW(FG_TAG, "MAX17048 not found at 0x%02X (%s)", MAX17048_ADDR, esp_err_to_name(err));
         return ESP_ERR_NOT_FOUND;
@@ -121,33 +121,33 @@ static void fg_task(void *arg)
         esp_err_t e2 = watch_fuel_read_vcell(&v);
 
         if (e1 == ESP_OK && e2 == ESP_OK) {
-            int pct = soc_piecewise_pct(soc);
+        int pct = soc_piecewise_pct(soc);
 
+        // Only publish if changed
+        bool pct_changed = (pct != g_watch_batt_pct);
+        bool v_changed   = (v != g_watch_batt_v); // float compare is fine if you don't care about tiny jitter
+
+        if (pct_changed) {
             g_watch_batt_pct = pct;
-            g_watch_batt_v   = v;
-            watch_shutdown_update(v, g_screen_awake);
-
-            int64_t now_ms = esp_timer_get_time() / 1000;
-
-            // Log only on changes OR every 2 min (awake) / 10 min (asleep)
-            int64_t log_period = g_screen_awake ? 120000 : 600000;
-            if (pct != last_pct || (now_ms - last_log_ms) > log_period) {
-                ESP_LOGI("BATT", "PCT: %d, VOLT: %.2f", pct, v);
-                last_pct = pct;
-                last_log_ms = now_ms;
-            }
-
-
-            if (g_screen_awake) {
-                lv_async_call(ui_set_watch_batt_async, (void*)(intptr_t)g_watch_batt_pct);
-            }
-        } else {
-            g_watch_batt_pct = -1;
-            g_watch_batt_v   = -1.0f;
-            if (g_screen_awake) {
-                lv_async_call(ui_set_watch_batt_async, (void*)(intptr_t)g_watch_batt_pct);
-            }
         }
+        // You may still want voltage updated even if pct didn't change:
+        g_watch_batt_v = v;
+
+        watch_shutdown_update(v, g_screen_awake);
+
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        int64_t log_period = g_screen_awake ? 120000 : 600000;
+        if (pct != last_pct || (now_ms - last_log_ms) > log_period) {
+            ESP_LOGI("BATT", "PCT: %d, VOLT: %.2f", pct, v);
+            last_pct = pct;
+            last_log_ms = now_ms;
+        }
+
+        if (g_screen_awake && pct_changed) {
+            lv_async_call(ui_set_watch_batt_async, (void*)(intptr_t)g_watch_batt_pct);
+        }
+    }
 
         vTaskDelay(pdMS_TO_TICKS(poll_ms));
     }

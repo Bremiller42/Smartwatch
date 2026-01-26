@@ -15,6 +15,7 @@
 #include "display.h"
 #include "esp_lcd_touch.h"   // esp_lcd_touch_*
 #include "esp_bsp.h"
+#include "watch_screen_timeout.h"
 
 static const char *TAG = "SLEEP_MGR";
 
@@ -230,11 +231,12 @@ static void manager_cb(lv_timer_t *t)
         enter_stage(SLP_BLE_SLOW);
     } else if (idle >= g_wifi_off_delay_ms) {
         enter_stage(SLP_WIFI_OFF);
-    } else if (idle >= g_screen_timeout_ms) {
-        enter_stage(SLP_SCREEN_OFF);
     } else {
-        enter_stage(SLP_AWAKE);
-    }
+    uint32_t to = screen_timeout_get_effective_ms();
+    if (to != 0 && idle >= to) enter_stage(SLP_SCREEN_OFF);
+    else                      enter_stage(SLP_AWAKE);
+    }   
+
 
     // Always service touch; stage controls cadence
     service_touch(tnow);

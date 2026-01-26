@@ -1,22 +1,13 @@
-// FILE: src/watch_logstream.h
+// FILE: watch_logstream.h
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-void watch_logstream_init(void);
-
-// Returns number of bytes drained into dst (0 if none)
+void   watch_logstream_init(void);
 size_t watch_logstream_read(char *dst, size_t dst_sz);
 
-// Optional stats
 uint32_t watch_logstream_dropped(void);
 uint32_t watch_logstream_written(void);
 
-#ifdef __cplusplus
-}
-#endif
+/* NEW: increments when new bytes are queued */
+uint32_t watch_logstream_seq(void);

@@ -123,6 +123,7 @@ typedef enum {
     UI_BLANK = 3,
     UI_LOG = 4,
     UI_POWER_MENU = 5,
+    UI_LOW_PWR = 6,
 } ui_screen_t;
 
 extern lv_obj_t *scr_blank;
@@ -131,6 +132,7 @@ extern lv_obj_t *scr_clock;
 extern lv_obj_t *scr_log;
 extern lv_obj_t *scr_settings;
 extern lv_obj_t *scr_power;
+extern lv_obj_t *scr_low_pwr;
 extern lv_obj_t *ble_status_lbl;   // optional
 extern lv_obj_t *clock_notification_icon_box;
 /* ---------------- Rotation ---------------- */

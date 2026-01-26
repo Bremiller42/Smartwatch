@@ -95,6 +95,7 @@ lv_obj_t *scr_settings = NULL;
 lv_obj_t *scr_blank    = NULL;
 lv_obj_t *scr_log      = NULL;
 lv_obj_t *scr_power    = NULL;
+lv_obj_t *scr_low_pwr  = NULL;   // <-- add
 
 uint16_t g_notif_counts[NG_MAX] = {0};
 

@@ -1,6 +1,8 @@
 // FILE: src/ui/ui_screen_settings.c
 #include "ui_priv.h"
 #include "esp_log.h"
+#include "watch_screen_timeout.h"
+
 static const char *UI_SS_TAG = "UI_SETTINGS";
 
 /* local (settings-only) labels */
@@ -10,7 +12,7 @@ static lv_obj_t *hr_period_sub_lbl = NULL;
 /* ---- Timeout tile helpers ---- */
 static uint32_t timeout_get_s(void)
 {
-    uint32_t s = g_screen_timeout_ms / 1000;
+    uint32_t s = screen_timeout_get_default_ms() / 1000;
     if (s != 15 && s != 30 && s != 60) s = 15;
     return s;
 }
@@ -34,7 +36,7 @@ static void on_timeout_tile_clicked(lv_event_t *e)
     else if (s == 30) s = 60;
     else s = 15;
 
-    g_screen_timeout_ms = s * 1000;
+    screen_timeout_set_default_ms(s * 1000);
     settings_save_screen_timeout_s(s);
 
     timeout_update_subtitle();

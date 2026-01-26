@@ -21,6 +21,8 @@
 
 static RingbufHandle_t s_rb = NULL;
 static vprintf_like_t s_orig_vprintf = NULL;
+static uint32_t s_seq = 0;
+uint32_t watch_logstream_seq(void) { return s_seq; }
 
 static uint32_t s_drop = 0;
 static uint32_t s_written = 0;
@@ -144,16 +146,19 @@ static int log_vprintf_hook(const char *fmt, va_list args)
     size_t len = strnlen(line, sizeof(line));
     bool has_nl = (len > 0 && line[len - 1] == '\n');
 
-    // Non-blocking send; if full, drop
-    if (xRingbufferSend(s_rb, line, len, 0) != pdTRUE) {
+    bool sent_any = false;
+
+    // send main line
+    if (xRingbufferSend(s_rb, line, len, 0) == pdTRUE) {
+        sent_any = true;
+    } else {
         s_drop++;
 
     #if LOG_PURGE_ON_FULL
-        // Drop old logs to recover space, then retry once
         logstream_purge_some(LOG_PURGE_DRAIN_BYTES);
-
-        if (xRingbufferSend(s_rb, line, len, 0) != pdTRUE) {
-            // still full; drop for real
+        if (xRingbufferSend(s_rb, line, len, 0) == pdTRUE) {
+            sent_any = true;
+        } else {
             return ret;
         }
     #else
@@ -165,16 +170,16 @@ static int log_vprintf_hook(const char *fmt, va_list args)
 
     if (!has_nl) {
         const char nl = '\n';
-        (void)xRingbufferSend(s_rb, &nl, 1, 0); // if it fails, whatever
-        s_written += 1;
-    }
-    static uint32_t s_last_purge_mark = 0;
-    if ((s_drop - s_last_purge_mark) >= 50) {
-        const char *m = "[logstream] PURGE (ringbuffer was full)\n";
-        (void)xRingbufferSend(s_rb, m, strlen(m), 0);
-        s_last_purge_mark = s_drop;
+        if (xRingbufferSend(s_rb, &nl, 1, 0) == pdTRUE) {
+            s_written += 1;
+            sent_any = true;
+        }
     }
 
+    // bump seq once per hook call if anything enqueued
+    if (sent_any) s_seq++;
+
+    s_written += (uint32_t)len;
     return ret;
 }
 

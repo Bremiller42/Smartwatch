@@ -1,3 +1,4 @@
+// FILE: watch_logbuf.c
 #include "watch_logbuf.h"
 #include <string.h>
 #include <stdbool.h>
@@ -17,13 +18,17 @@ static uint32_t s_seq = 0;
 
 void watch_logbuf_init(void)
 {
-    s_mu = xSemaphoreCreateMutex();
+    if (!s_mu) s_mu = xSemaphoreCreateMutex();
 }
 
-/* NEW */
+/* NEW: safe read */
 uint32_t watch_logbuf_seq(void)
 {
-    return s_seq;
+    if (!s_mu) return 0;
+    xSemaphoreTake(s_mu, portMAX_DELAY);
+    uint32_t v = s_seq;
+    xSemaphoreGive(s_mu);
+    return v;
 }
 
 void watch_logbuf_write(const char *s, size_t len)
@@ -41,7 +46,7 @@ void watch_logbuf_write(const char *s, size_t len)
         }
     }
 
-    /* NEW: bump once per write batch */
+    /* bump once per write batch */
     s_seq++;
 
     xSemaphoreGive(s_mu);

@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sleep.h"
+#include "esp_attr.h"   // RTC_DATA_ATTR
 
 #include "watch_globals.h"
 #include "watch_power.h"
@@ -14,7 +15,7 @@
 #include "lvgl.h"
 #include "ui_priv.h"
 
-static const char *TAG = "SHDN";
+static const char *TAG = "CRIT_PWR";
 
 typedef struct {
     float low_v;
@@ -29,16 +30,22 @@ typedef struct {
 } shdn_cfg_t;
 
 static shdn_cfg_t s_cfg = {
-    .low_v = 3.55f,
-    .low_exit_v = 3.62f,
-    .critical_v = 3.40f,
-    .critical_exit_v = 3.47f,
-    .shutdown_v = 3.30f,
-    .shutdown_confirm_ms = 10000,
-    .min_transition_ms = 1500,
-    .dim_pct_low = 35,
-    .dim_pct_critical = 10,
+    .low_v              = 3.65f,
+    .low_exit_v         = 3.75f,
+
+    .critical_v         = 3.50f,
+    .critical_exit_v    = 3.60f,
+
+    .shutdown_v         = 3.35f,
+    .shutdown_confirm_ms = 8000,
+
+    .min_transition_ms  = 2000,
+    .dim_pct_low        = 35,
+    .dim_pct_critical   = 10,
 };
+
+static bool s_ready = false;
+float watch_shutdown_get_critical_v(void) { return s_cfg.critical_v; }
 
 static shdn_state_t s_state = SHDN_OK;
 static int64_t s_below_shutdown_since_ms = -1;
@@ -46,17 +53,43 @@ static int64_t s_last_transition_ms = 0;
 static bool s_actions_applied_low = false;
 static bool s_actions_applied_critical = false;
 
+/* ✅ RTC latch: survives deep sleep without flash/NVS writes */
+RTC_DATA_ATTR static uint8_t s_low_pwr_latch = 0;
+
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 static bool can_transition(void) { return (now_ms() - s_last_transition_ms) > s_cfg.min_transition_ms; }
 
-// FIXED: lv_async cb signature is void (*)(void*)
+/* ---------------- Public helpers ---------------- */
+bool watch_shutdown_is_ready(void)
+{
+    return s_ready;
+}
+
+void watch_shutdown_set_low_power_latch(bool on)
+{
+    s_low_pwr_latch = on ? 1 : 0;
+}
+
+bool watch_shutdown_low_power_latched(void)
+{
+    return (s_low_pwr_latch != 0);
+}
+
+/* ---------------- UI helpers ---------------- */
 static void ui_warn_async(void *arg)
 {
     const char *msg = (const char *)arg;
     (void)msg;
-    // Optional: display msg somewhere (toast/label). For now, do nothing.
+    // You can show msg via a toast/label later
 }
 
+static void ui_show_low_pwr_async(void *arg)
+{
+    (void)arg;
+    ui_show(UI_LOW_PWR);
+}
+
+/* ---------------- Actions ---------------- */
 static void apply_low_actions(void)
 {
     if (s_actions_applied_low) return;
@@ -66,7 +99,7 @@ static void apply_low_actions(void)
     apply_backlight_percent(s_cfg.dim_pct_low);
     (void)watch_power_set_profile_sleep();
 
-    lv_async_call(ui_warn_async, (void*)"LOW BATTERY");
+    lv_async_call(ui_warn_async, (void *)"LOW BATTERY");
 }
 
 static void apply_critical_actions(void)
@@ -74,23 +107,27 @@ static void apply_critical_actions(void)
     if (s_actions_applied_critical) return;
     s_actions_applied_critical = true;
 
+    /* ✅ latch critical UI state */
+    watch_shutdown_set_low_power_latch(true);
+
     ESP_LOGE(TAG, "CRITICAL battery actions");
     apply_backlight_percent(s_cfg.dim_pct_critical);
     (void)watch_power_set_profile_sleep();
 
-    // Emergency-off radios WITHOUT changing user preference globals
+    /* ✅ show low power screen as “last screen” */
+    lv_async_call(ui_show_low_pwr_async, NULL);
+
     ESP_LOGW(TAG, "Emergency disabling Wi-Fi/BLE (critical)");
     wifi_stop();
     ble_set_enabled(false);
 
-    lv_async_call(ui_warn_async, (void*)"CRITICAL BATTERY");
+    lv_async_call(ui_warn_async, (void *)"CRITICAL BATTERY");
 }
 
 static void prepare_for_sleep(void)
 {
     ESP_LOGW(TAG, "Preparing for deep sleep");
-    // Best effort commit if safe (settings_commit_dirty_now already gates)
-    settings_commit_dirty_now();
+    settings_commit_dirty_now(); // already gated in settings
 }
 
 static void enter_deep_sleep(void)
@@ -99,6 +136,7 @@ static void enter_deep_sleep(void)
     esp_deep_sleep_start();
 }
 
+/* ---------------- API ---------------- */
 esp_err_t watch_shutdown_init(void)
 {
     s_state = SHDN_OK;
@@ -106,7 +144,10 @@ esp_err_t watch_shutdown_init(void)
     s_last_transition_ms = 0;
     s_actions_applied_low = false;
     s_actions_applied_critical = false;
-    ESP_LOGI(TAG, "Shutdown controller initialized");
+
+    s_ready = true;
+
+    ESP_LOGI(TAG, "Shutdown controller initialized (latch=%u)", (unsigned)s_low_pwr_latch);
     return ESP_OK;
 }
 
@@ -131,6 +172,7 @@ void watch_shutdown_update(float vbat, bool screen_awake)
     switch (s_state) {
         case SHDN_OK:
             if (!can_transition()) break;
+
             if (vbat <= s_cfg.critical_v) {
                 s_state = SHDN_CRITICAL;
                 s_last_transition_ms = t;
@@ -147,10 +189,15 @@ void watch_shutdown_update(float vbat, bool screen_awake)
                 ESP_LOGI(TAG, "Battery recovered -> OK");
                 s_state = SHDN_OK;
                 s_last_transition_ms = t;
+
                 s_actions_applied_low = false;
                 s_actions_applied_critical = false;
+
+                /* optional: also clear latch if you want recovery to restore normal boot */
+                watch_shutdown_set_low_power_latch(false);
                 break;
             }
+
             if (can_transition() && vbat <= s_cfg.critical_v) {
                 s_state = SHDN_CRITICAL;
                 s_last_transition_ms = t;
@@ -163,6 +210,9 @@ void watch_shutdown_update(float vbat, bool screen_awake)
                 ESP_LOGI(TAG, "Recovered -> LOW");
                 s_state = SHDN_LOW;
                 s_last_transition_ms = t;
+
+                /* ✅ clear latch once recovered enough */
+                watch_shutdown_set_low_power_latch(false);
             }
 
             if (s_below_shutdown_since_ms > 0 &&

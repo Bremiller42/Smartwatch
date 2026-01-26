@@ -104,3 +104,4 @@ void ui_hr_widget_refresh_request(void);
 void log_screen_refresh(lv_timer_t *t);
 void ui_log_screen_pause(bool pause);
 lv_obj_t *ui_build_power_menu(void);
+lv_obj_t *ui_build_low_pwr_screen(void);
