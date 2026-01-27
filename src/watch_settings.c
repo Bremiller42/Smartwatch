@@ -2,7 +2,7 @@
 #include "watch_globals.h"
 #include <math.h>
 #include "watch_heartrate.h"   // hr_set_boot_bpm_current()
-
+#include "watch_screen_timeout.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_err.h"
@@ -132,12 +132,14 @@ void settings_load_from_nvs(void)
     if (err_sto == ESP_OK) {
         if (sto != 15 && sto != 30 && sto != 60) sto = 15;
         g_screen_timeout_ms = sto * 1000;
+
+        screen_timeout_set_default_ms(g_screen_timeout_ms);
+
         ESP_LOGI(SET_TAG, "Loaded screen_timeout=%us", (unsigned)sto);
     } else {
         ESP_LOGW(SET_TAG, "screen_timeout not found (%s). Using default=%ums",
                  esp_err_to_name(err_sto), (unsigned)g_screen_timeout_ms);
-    }
-
+        }
     uint8_t bon = 0;
     esp_err_t err_ble = nvs_get_u8(g_nvs, KEY_BLE_ON, &bon);
     if (err_ble == ESP_OK) {

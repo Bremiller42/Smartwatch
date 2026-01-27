@@ -18,6 +18,7 @@
 #include "esp_lcd_types.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
+#include "stdbool.h"
 #include "esp_lcd_panel_ops.h"
 #include "lvgl.h"
 #include "esp_lcd_touch.h"
@@ -149,6 +150,8 @@ void bsp_display_te_pause(void);
 void bsp_display_te_resume(void);
 void bsp_display_panel_on(bool on);
 esp_lcd_touch_handle_t bsp_display_get_touch(void);
+// NEW: gate LVGL's draw_wait_cb so LVGL won't block when TE is disabled/panel is off
+void bsp_display_sync_gate(bool enable);
 
 #ifdef __cplusplus
 }
