@@ -32,6 +32,9 @@
 #include "watch_loghook.h"
 #include "watch_logstream.h"
 #include "watch_shutdown.h"
+#include "watch_sdcard.h"
+#include "watch_boot_guard.h"
+#include "watch_backlight.h"
 
 static const char *MAIN_TAG = "SmartWatch";
 
@@ -82,16 +85,19 @@ static bool boot_guard_check_and_arm(void)
     float vbat = -1.0f;
     esp_err_t e = watch_fuel_read_vcell(&vbat);
 
-    float crit = watch_shutdown_get_critical_v();  // from watch_shutdown.c API we discussed
+    float crit = watch_shutdown_get_critical_v();
 
     if ((e == ESP_OK && vbat > 0.0f && vbat <= crit) || latched) {
 
         ESP_LOGW(MAIN_TAG, "BOOT GUARD: vbat=%.2f crit=%.2f latched=%d -> LOW_PWR then sleep",
                  vbat, crit, (int)latched);
 
-        // keep it visible, but dim
+        // Keep screen awake so UI can render
         g_screen_awake = true;
-        apply_backlight_percent(15);
+
+        // ✅ Dim using CAP policy (does NOT overwrite user preference)
+        backlight_set_cap_pct(15);
+        backlight_apply_now();
 
         // stop radios (optional but recommended)
         wifi_stop();
@@ -144,10 +150,10 @@ static void display_init(void)
 #endif
     };
 
+    // This also initializes LEDC backlight PWM via bsp_display_brightness_init()
     bsp_display_start_with_config(&cfg);
 
-    // Apply backlight early (user setting)
-    apply_backlight_percent(g_brightness);
+    // NOTE: do NOT set brightness here anymore; backlight manager owns policy.
 }
 
 static void ui_init(void)
@@ -202,6 +208,12 @@ void setup(void)
     LOG_SECTION("Init display");
     display_init();
 
+    // ✅ Backlight manager must be initialized AFTER display_init (LEDC is ready now)
+    LOG_SECTION("Init backlight policy");
+    backlight_init(g_brightness);   // g_brightness = persisted user preference
+    backlight_set_cap_pct(100);     // normal cap
+    backlight_apply_now();          // apply effective brightness (min(user, cap))
+
     LOG_SECTION("Create UI");
     ui_init();
 
@@ -211,10 +223,18 @@ void setup(void)
     LOG_SECTION("Init I2C (early)");
     ESP_ERROR_CHECK(watch_i2c_init());
 
+    LOG_SECTION("SD CARD SELF TEST");
+    esp_err_t sdtest = watch_sdcard_self_test(3000);
+    if (sdtest == ESP_OK) {
+        ESP_LOGI("MAIN", "SD self-test PASSED");
+    } else {
+        ESP_LOGE("MAIN", "SD self-test FAILED: %s", esp_err_to_name(sdtest));
+    }
+
     LOG_SECTION("Init shutdown controller");
     watch_shutdown_init();
 
-    // ✅ Optional: probe MAX17048 once (so vcell read is reliable)
+    // Optional: probe MAX17048 once (so vcell read is reliable)
     (void)watch_fuel_init();
 
     // ✅ BOOT GUARD: if low/latched, show UI_LOW_PWR and schedule shutdown, then STOP boot
@@ -234,13 +254,12 @@ void setup(void)
     settings_load_hr_current_into_ui();
 
     LOG_SECTION("Bring up services");
-    bringup_services();   // <-- update this to NOT call watch_i2c_init anymore
+    bringup_services();
 
     watch_audio_beep(880,  60);
     watch_audio_beep(1320, 50);
     watch_audio_beep(1760, 70);
 }
-
 
 void loop(void)
 {

@@ -3,6 +3,8 @@
 #include "esp_log.h"
 #include <time.h>
 #include "ui_color_pallete.h"
+#include "watch_globals.h"
+
 static const char *UI_CLK_TAG = "UI_CLK";
 
 extern float g_watch_batt_v;    // from watch_fuel.c
@@ -10,13 +12,6 @@ static int s_watch_batt_pct = -1;
 
 int  g_phone_batt_pct = -1;
 bool g_phone_batt_charging = false;
-
-void apply_backlight_percent(int pct)
-{
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    bsp_display_brightness_set(pct);
-}
 
 void ui_update_ip_label(void)
 {
@@ -113,7 +108,6 @@ void clock_update_wifi_icon_now(void)
         return;
     }
 
-    // keep single icon for now (as you had)
     lv_label_set_text(clock_wifi_icon, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_opa(clock_wifi_icon, LV_OPA_COVER, 0);
 }
@@ -146,10 +140,8 @@ void ui_update_ble_icon_async(void *arg)
     bsp_display_unlock();
 }
 
-/* If your BLE task sets a dirty flag, keep using it */
 void ui_ble_pump_updates(void)
 {
-    // you had ble_ui_take_dirty(); keep call if it exists
     extern bool ble_ui_take_dirty(void);
     if (!ble_ui_take_dirty()) return;
 
@@ -205,7 +197,6 @@ static void ui_update_watch_batt_cb(void *arg)
     lv_label_set_text(watch_batt_lbl, buf);
 
     lv_obj_set_style_text_color(watch_batt_lbl, UI_COLOR(battery_color(s_watch_batt_pct)), 0);
-
 }
 
 void ui_set_watch_batt(int pct, float volts_unused)
@@ -244,6 +235,4 @@ static void clock_timer_cb_impl(lv_timer_t *t)
     }
 }
 
-// exported symbol used by your builder
 void clock_timer_cb(lv_timer_t *t) { clock_timer_cb_impl(t); }
-

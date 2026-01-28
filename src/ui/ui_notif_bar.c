@@ -2,7 +2,7 @@
 #include "ui_priv.h"
 #include "esp_log.h"
 #include "../watch_icons/watch_icons.h"
-
+#include "watch_audio.h"
 static const char *UI_NOTI_TAG = "UI_NOTIF";
 
 
@@ -135,6 +135,8 @@ void ui_notif_add(notif_type_t t)
 {
     if (t < 0 || t >= NG_MAX) return;
     if (g_notif_counts[t] < 999) g_notif_counts[t]++;
+    watch_audio_beep(2000, 70);
+    watch_audio_beep(1500, 70);
 
     g_notif_dirty = true;
     ui_notif_refresh_async();

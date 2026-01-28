@@ -1,16 +1,32 @@
+// FILE: src/watch_settings.c
 #include "watch_settings.h"
 #include "watch_globals.h"
-#include <math.h>
-#include "watch_heartrate.h"   // hr_set_boot_bpm_current()
+#include "watch_heartrate.h"       // hr_set_boot_bpm_current()
+#include "watch_shutdown.h"
 #include "watch_screen_timeout.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_err.h"
 
-// NEW
-#include "watch_shutdown.h"
+/*
+ * Ensure these exist somewhere in your project (you already had them):
+ * - NVS_NS
+ * - KEY_WIFI_SSID, KEY_WIFI_PASS, KEY_BRIGHTNESS, KEY_USE_24H, KEY_WIFI_ON,
+ *   KEY_SCREEN_TIMEOUT, KEY_BLE_ON, KEY_HR_CUR_VALID, KEY_HR_CUR_BPM_X100, etc.
+ *
+ * NEW key:
+ */
+#ifndef KEY_SCREEN_ALWAYS_ON
+#define KEY_SCREEN_ALWAYS_ON "scr_always"
+#endif
 
-const char *SET_TAG = "GLOBALS";
+static const char *SET_TAG = "GLOBALS";
 
 // NEW: gate commits when battery is critical+
 static inline bool nvs_safe_to_commit(void)
@@ -88,6 +104,32 @@ void settings_save_wifi_creds(const char *ssid, const char *pass)
     snprintf(g_wifi_pass, sizeof(g_wifi_pass), "%s", pass);
 }
 
+// NEW: save always-on flag
+void settings_save_screen_always_on(bool on)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(SET_TAG, "Save always_on skipped (NVS not ready)");
+        return;
+    }
+
+    esp_err_t err = nvs_set_u8(g_nvs, KEY_SCREEN_ALWAYS_ON, on ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "Save always_on set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // If you have a dedicated dirty flag, use it; otherwise reuse screen_timeout_dirty.
+    g_settings_dirty.screen_timeout_dirty = true;
+
+    if (nvs_safe_to_commit()) {
+        err = nvs_commit(g_nvs);
+        ESP_LOGI(SET_TAG, "Saved always_on=%d (%s)", (int)on, esp_err_to_name(err));
+        if (err == ESP_OK) g_settings_dirty.screen_timeout_dirty = false;
+    } else {
+        ESP_LOGW(SET_TAG, "always_on commit deferred (battery critical)");
+    }
+}
+
 void settings_load_from_nvs(void)
 {
     if (!g_nvs_ok) return;
@@ -132,14 +174,27 @@ void settings_load_from_nvs(void)
     if (err_sto == ESP_OK) {
         if (sto != 15 && sto != 30 && sto != 60) sto = 15;
         g_screen_timeout_ms = sto * 1000;
-
-        screen_timeout_set_default_ms(g_screen_timeout_ms);
-
         ESP_LOGI(SET_TAG, "Loaded screen_timeout=%us", (unsigned)sto);
     } else {
         ESP_LOGW(SET_TAG, "screen_timeout not found (%s). Using default=%ums",
                  esp_err_to_name(err_sto), (unsigned)g_screen_timeout_ms);
-        }
+    }
+
+    // Apply default timeout into timeout module
+    screen_timeout_set_default_ms(g_screen_timeout_ms);
+
+    // NEW: load always-on flag and apply
+    uint8_t aon = 0;
+    esp_err_t err_aon = nvs_get_u8(g_nvs, KEY_SCREEN_ALWAYS_ON, &aon);
+    if (err_aon == ESP_OK) {
+        bool on = (aon != 0);
+        screen_timeout_set_always_on(on);
+        ESP_LOGI(SET_TAG, "Loaded always_on=%d", (int)on);
+    } else {
+        screen_timeout_set_always_on(false);
+        ESP_LOGW(SET_TAG, "always_on not found (%s). default=0", esp_err_to_name(err_aon));
+    }
+
     uint8_t bon = 0;
     esp_err_t err_ble = nvs_get_u8(g_nvs, KEY_BLE_ON, &bon);
     if (err_ble == ESP_OK) {

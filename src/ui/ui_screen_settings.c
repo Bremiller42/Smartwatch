@@ -1,13 +1,19 @@
 // FILE: src/ui/ui_screen_settings.c
 #include "ui_priv.h"
+
 #include "esp_log.h"
 #include "watch_screen_timeout.h"
+#include "watch_settings.h"
+#include "watch_globals.h"
+#include "watch_heartrate.h"
 
 static const char *UI_SS_TAG = "UI_SETTINGS";
 
 /* local (settings-only) labels */
-static lv_obj_t *timeout_sub_lbl = NULL;
-static lv_obj_t *hr_period_sub_lbl = NULL;
+static lv_obj_t *timeout_sub_lbl    = NULL;
+static lv_obj_t *always_on_sub_lbl  = NULL;
+static lv_obj_t *hr_period_sub_lbl  = NULL;
+static lv_obj_t *t_always_on = NULL;
 
 /* ---- Timeout tile helpers ---- */
 static uint32_t timeout_get_s(void)
@@ -21,15 +27,33 @@ static void timeout_update_subtitle(void)
 {
     if (!timeout_sub_lbl) return;
 
+    if (screen_timeout_get_always_on()) {
+        lv_label_set_text(timeout_sub_lbl, "Always");
+        return;
+    }
+
     uint32_t s = timeout_get_s();
     static char buf[16];
     snprintf(buf, sizeof(buf), "%lus", (unsigned long)s);
     lv_label_set_text(timeout_sub_lbl, buf);
 }
 
+static void always_on_update_subtitle(void)
+{
+    if (!always_on_sub_lbl) return;
+    lv_label_set_text(always_on_sub_lbl, screen_timeout_get_always_on() ? "On" : "Off");
+}
+
 static void on_timeout_tile_clicked(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    // Choosing a timeout implies leaving always-on mode
+    if (screen_timeout_get_always_on()) {
+        screen_timeout_set_always_on(false);
+        settings_save_screen_always_on(false);
+        always_on_update_subtitle();
+    }
 
     uint32_t s = timeout_get_s();
     if (s == 15) s = 30;
@@ -39,6 +63,21 @@ static void on_timeout_tile_clicked(lv_event_t *e)
     screen_timeout_set_default_ms(s * 1000);
     settings_save_screen_timeout_s(s);
 
+    timeout_update_subtitle();
+    mark_user_activity();
+}
+
+static void on_always_on_tile_clicked(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    bool on = !screen_timeout_get_always_on();
+    tile_set_on(t_always_on, on);
+
+    screen_timeout_set_always_on(on);
+    settings_save_screen_always_on(on);
+
+    always_on_update_subtitle();
     timeout_update_subtitle();
     mark_user_activity();
 }
@@ -62,13 +101,13 @@ static void hr_period_apply_preset(hr_period_preset_t p)
     s_hr_preset = p;
 
     switch (p) {
-        case HRP_OFF:       g_hr_period_ms = 0;           g_hr_run_ms = 0;        break;
-        case HRP_ALWAYS_ON: g_hr_period_ms = 1000;        g_hr_run_ms = 1000;     break;
-        case HRP_30S:       g_hr_period_ms = 30 * 1000;   g_hr_run_ms = 10 * 1000;break;
-        case HRP_1M:        g_hr_period_ms = 60 * 1000;   g_hr_run_ms = 10 * 1000;break;
-        case HRP_5M:        g_hr_period_ms = 5 * 60 * 1000; g_hr_run_ms = 10 * 1000;break;
-        case HRP_10M:       g_hr_period_ms = 10 * 60 * 1000; g_hr_run_ms = 10 * 1000;break;
-        case HRP_1H:        g_hr_period_ms = 60 * 60 * 1000; g_hr_run_ms = 10 * 1000;break;
+        case HRP_OFF:        g_hr_period_ms = 0;              g_hr_run_ms = 0;         break;
+        case HRP_ALWAYS_ON:  g_hr_period_ms = 1000;           g_hr_run_ms = 1000;      break;
+        case HRP_30S:        g_hr_period_ms = 30 * 1000;      g_hr_run_ms = 10 * 1000; break;
+        case HRP_1M:         g_hr_period_ms = 60 * 1000;      g_hr_run_ms = 10 * 1000; break;
+        case HRP_5M:         g_hr_period_ms = 5 * 60 * 1000;  g_hr_run_ms = 10 * 1000; break;
+        case HRP_10M:        g_hr_period_ms = 10 * 60 * 1000; g_hr_run_ms = 10 * 1000; break;
+        case HRP_1H:         g_hr_period_ms = 60 * 60 * 1000; g_hr_run_ms = 10 * 1000; break;
         default: break;
     }
 }
@@ -76,14 +115,14 @@ static void hr_period_apply_preset(hr_period_preset_t p)
 static const char *hr_period_preset_text(hr_period_preset_t p)
 {
     switch (p) {
-        case HRP_OFF:       return "Off";
-        case HRP_ALWAYS_ON: return "Always On";
-        case HRP_30S:       return "30s";
-        case HRP_1M:        return "1m";
-        case HRP_5M:        return "5m";
-        case HRP_10M:       return "10m";
-        case HRP_1H:        return "1h";
-        default:            return "";
+        case HRP_OFF:        return "Off";
+        case HRP_ALWAYS_ON:  return "Always On";
+        case HRP_30S:        return "30s";
+        case HRP_1M:         return "1m";
+        case HRP_5M:         return "5m";
+        case HRP_10M:        return "10m";
+        case HRP_1H:         return "1h";
+        default:             return "";
     }
 }
 
@@ -254,9 +293,11 @@ lv_obj_t *ui_build_settings_screen(void)
     tile_set_on(t_placeholder1, false);
     lv_obj_set_grid_cell(t_placeholder1, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 1, 1);
 
-    lv_obj_t *t_placeholder2 = tile_create_base(g_disp, "Always On", "Later", NULL);
-    tile_set_on(t_placeholder2, false);
-    lv_obj_set_grid_cell(t_placeholder2, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 1, 1);
+    t_always_on = tile_create_base(g_disp, "Always On", "", &always_on_sub_lbl);
+    lv_obj_set_grid_cell(t_always_on, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 1, 1);
+    always_on_update_subtitle();
+    lv_obj_add_event_cb(t_always_on, on_always_on_tile_clicked, LV_EVENT_CLICKED, NULL);
+    tile_set_on(t_always_on, screen_timeout_get_always_on());
 
     // NETWORK GRID
     lv_obj_t *g_net = lv_obj_create(tab_network);

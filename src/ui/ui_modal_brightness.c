@@ -2,17 +2,24 @@
 #include "ui_priv.h"
 #include "esp_log.h"
 
+#include "watch_backlight.h"
+#include "watch_settings.h"
+
 static const char *UI_BRT_TAG = "UI_BRIGHT";
 
-
 static lv_obj_t *brightness_modal = NULL;
-
+static lv_obj_t *s_slider = NULL;
+static int user_pct = 0;
 static void brightness_modal_close(lv_event_t *e)
 {
     (void)e;
     if (brightness_modal) {
+        ESP_LOGI(UI_BRT_TAG, "Brightness user=%d -> saving", user_pct);
+        settings_save_brightness(user_pct);
+        
         lv_obj_del(brightness_modal);
         brightness_modal = NULL;
+        s_slider = NULL;
     }
 }
 
@@ -21,12 +28,10 @@ static void on_brightness_changed(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
 
     lv_obj_t *slider = lv_event_get_target(e);
-    g_brightness = lv_slider_get_value(slider);
+    user_pct = (int)lv_slider_get_value(slider);
 
-    apply_backlight_percent(g_brightness);
-
-    ESP_LOGI(UI_BRT_TAG, "Brightness=%d -> saving", g_brightness);
-    settings_save_brightness(g_brightness);
+    // Set user preference (does not exceed cap in UI range, but this is still “user”)
+    backlight_set_user_pct(user_pct);
 
     mark_user_activity();
 }
@@ -50,17 +55,28 @@ void open_brightness_modal(lv_obj_t *parent)
     lv_label_set_text(t, "Brightness");
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 8);
 
-    brightness_slider = lv_slider_create(card);
-    lv_obj_set_width(brightness_slider, lv_pct(90));
-    lv_obj_align(brightness_slider, LV_ALIGN_CENTER, 0, 15);
-    lv_slider_set_range(brightness_slider, 10, 100);
-    lv_slider_set_value(brightness_slider, g_brightness, LV_ANIM_OFF);
-    lv_obj_add_event_cb(brightness_slider, on_brightness_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    // Cap is policy (battery/thermal). User can only pick up to cap here.
+    int cap = backlight_get_cap_pct();
+    if (cap < 10) cap = 10;
 
-    lv_obj_t *close = lv_btn_create(card);
-    lv_obj_set_size(close, 90, 36);
-    lv_obj_align(close, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_add_event_cb(close, brightness_modal_close, LV_EVENT_CLICKED, NULL);
-    lv_label_set_text(lv_label_create(close), "Close");
-    lv_obj_center(lv_obj_get_child(close, 0));
+    s_slider = lv_slider_create(card);
+    lv_obj_set_width(s_slider, lv_pct(90));
+    lv_obj_align(s_slider, LV_ALIGN_CENTER, 0, 15);
+
+    lv_slider_set_range(s_slider, 10, cap);
+
+    // What the screen actually shows right now
+    int eff = backlight_get_effective_pct();
+    if (eff < 10) eff = 10;
+    if (eff > cap) eff = cap;
+
+    lv_slider_set_value(s_slider, eff, LV_ANIM_OFF);
+    lv_obj_add_event_cb(s_slider, on_brightness_changed, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *save = lv_btn_create(card);
+    lv_obj_set_size(save, 90, 36);
+    lv_obj_align(save, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_add_event_cb(save, brightness_modal_close, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(save), "Save");
+    lv_obj_center(lv_obj_get_child(save, 0));
 }

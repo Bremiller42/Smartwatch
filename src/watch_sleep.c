@@ -1,11 +1,15 @@
 // FILE: watch_sleep.c
 //
 // Power-focused sleep manager for LVGL8 + ESP32-S3 smartwatch
-// Adds SAFE panel off/on + TE pause/resume without LVGL deadlocks by using bsp_display_sync_gate().
+// Fixes:
+// - Screen timeout applies regardless of radio stage
+// - Screen state owned ONLY here (no double-toggle via enter_stage)
+// - Touch wake uses IRQ hint
 //
-// Requirements in display.c:
-//  - bsp_display_sync_gate(bool enable) implemented
-//  - bsp_display_te_pause/resume do NOT vTaskSuspend the TE task (disable/enable IRQ only)
+// Brightness policy update:
+// - Sleep manager does NOT change user brightness
+// - On wake: re-apply effective brightness via backlight manager (min(user, cap))
+// - On sleep: BSP backlight is turned off (0% PWM)
 
 #include "watch_sleep.h"
 
@@ -14,8 +18,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
-#include "watch_globals.h"          // g_last_activity_ms, g_screen_awake, g_ignore_until_ms, etc.
-#include "ui_priv.h"               // ui_show(UI_BLANK), UI_CLOCK, etc.
+#include "watch_globals.h"
+#include "ui_priv.h"
 #include "watch_power.h"
 #include "watch_wifi.h"
 #include "watch_ble.h"
@@ -23,6 +27,7 @@
 #include "esp_lcd_touch.h"
 #include "esp_bsp.h"
 #include "watch_screen_timeout.h"
+#include "watch_backlight.h"   // ✅ NEW
 
 static const char *TAG = "SLEEP_MGR";
 
@@ -37,17 +42,13 @@ uint32_t g_ble_off_delay_ms  = 8 * 60 * 1000;
 static lv_timer_t *s_mgr_timer = NULL;
 
 static volatile bool s_touch_pending = false;
+static uint32_t s_last_touch_read_ms  = 0; // reserved if you later add “read once” debounce
 static esp_lcd_touch_handle_t s_tp = NULL;
 
 /* Forced-off tracking (policy state, not user intent) */
 static bool s_wifi_forced_off = false;
 static bool s_ble_forced_off  = false;
-
 static lv_disp_t *s_disp = NULL;
-
-// Track actual HW state so we don't spam panel/TE toggles
-static bool s_panel_on = true;
-static bool s_te_on    = true;
 
 static inline uint32_t now_ms(void)
 {
@@ -58,25 +59,7 @@ static inline uint32_t now_ms(void)
 static void manager_adjust_period(void)
 {
     if (!s_mgr_timer) return;
-    lv_timer_set_period(s_mgr_timer, g_screen_awake ? 50 : 300); // tune 300->500/800 if stable
-}
-
-/* ---------- Low-level helpers ---------- */
-static void te_set(bool on)
-{
-    if (on == s_te_on) return;
-    s_te_on = on;
-
-    if (on) bsp_display_te_resume();
-    else    bsp_display_te_pause();
-}
-
-static void panel_set(bool on)
-{
-    if (on == s_panel_on) return;
-    s_panel_on = on;
-
-    bsp_display_panel_on(on);
+    lv_timer_set_period(s_mgr_timer, g_screen_awake ? 50 : 300); // tune if needed
 }
 
 /* ---------- Screen actions (owned ONLY here) ---------- */
@@ -85,29 +68,17 @@ static void screen_sleep_local(void)
     if (!g_screen_awake) return;
     g_screen_awake = false;
 
-    // 1) Ensure panel + TE are ON and sync gate is ENABLED so lv_refr_now can complete safely
-    bsp_display_sync_gate(true);
-    panel_set(true);
-    te_set(true);
-
-    // 2) Render BLANK and force flush now (while TE is available)
+    // Swap to blank screen while still “awake” to avoid weird residual artifacts
     bsp_display_lock(0);
     ui_show(UI_BLANK);
-    lv_refr_now(s_disp);   // push blank frame
+    lv_refr_now(NULL);
     bsp_display_unlock();
 
-    // 3) Backlight OFF (largest saver)
-    bsp_display_backlight_off();
-
-    // 4) IMPORTANT: Stop LVGL from waiting on TE while screen is "off"
-    bsp_display_sync_gate(false);
-
-    // 5) Now it's safe to stop TE + turn panel off
-    te_set(false);
-    panel_set(false);
+    // Hard off: 0% PWM (does not modify user preference or cap)
+    backlight_set_screen_on(false);
 
     manager_adjust_period();
-    ESP_LOGI(TAG, "Screen -> OFF (blank flushed, sync gated, TE off, panel off, backlight off)");
+    ESP_LOGI(TAG, "Screen -> OFF (backlight off)");
 }
 
 static void screen_wake_local(void)
@@ -115,26 +86,22 @@ static void screen_wake_local(void)
     if (g_screen_awake) return;
     g_screen_awake = true;
 
-    // 1) Bring panel + TE back first
-    panel_set(true);
-    te_set(true);
-
-    // 2) Re-enable sync gating so flushes can wait on TE again
-    bsp_display_sync_gate(true);
-
-    // 3) Draw UI while backlight still off (no flash)
     bsp_display_lock(0);
     ui_show(UI_CLOCK);
-    lv_refr_now(s_disp);   // push first frame
+    lv_refr_now(NULL);
     bsp_display_unlock();
 
+    // Refresh notifications (if you want)
     ui_notif_refresh_async();
 
-    // 4) Backlight last
-    apply_backlight_percent(g_brightness);
+    // ✅ Re-apply effective brightness (min(user, cap)) without changing user preference
+    backlight_set_screen_on(true);
 
     manager_adjust_period();
-    ESP_LOGI(TAG, "Screen -> ON (panel on, TE on, sync enabled, backlight restored)");
+    ESP_LOGI(TAG, "Screen -> ON (brightness eff=%d user=%d cap=%d)",
+             backlight_get_effective_pct(),
+             backlight_get_user_pct(),
+             backlight_get_cap_pct());
 }
 
 /* ---------- Radio restore helpers (only restore what *we* forced off) ---------- */
@@ -210,13 +177,13 @@ static void enter_stage(sleep_stage_t st)
     }
 }
 
-/* ---------- Touch service (IRQ-driven wake when screen is off) ---------- */
+/* ---------- Touch service (IRQ-driven when screen is off) ---------- */
 static void service_touch(uint32_t tnow)
 {
     if (!s_tp) return;
 
     // Did we get a touch IRQ hint since last tick?
-    const bool had_irq = s_touch_pending;
+    bool had_irq = s_touch_pending;
     if (had_irq) {
         s_touch_pending = false;
         g_last_activity_ms = tnow;   // treat IRQ as activity
@@ -230,6 +197,8 @@ static void service_touch(uint32_t tnow)
         g_ignore_until_ms = tnow + 250;
         g_require_release_after_wake = true;
     }
+
+    // When awake: LVGL handles reading coords, no work needed here.
 }
 
 /* ---------- LVGL timer callback ---------- */
@@ -248,10 +217,10 @@ static void manager_cb(lv_timer_t *t)
     else                  screen_wake_local();
 
     // Radio policy (independent)
-    if (idle >= g_ble_off_delay_ms)        enter_stage(SLP_BLE_OFF);
-    else if (idle >= g_ble_slow_delay_ms)  enter_stage(SLP_BLE_SLOW);
-    else if (idle >= g_wifi_off_delay_ms)  enter_stage(SLP_WIFI_OFF);
-    else                                   enter_stage(SLP_AWAKE);
+    if (idle >= g_ble_off_delay_ms)       enter_stage(SLP_BLE_OFF);
+    else if (idle >= g_ble_slow_delay_ms) enter_stage(SLP_BLE_SLOW);
+    else if (idle >= g_wifi_off_delay_ms) enter_stage(SLP_WIFI_OFF);
+    else                                  enter_stage(SLP_AWAKE);
 
     // Touch service may wake us
     service_touch(tnow);
@@ -259,26 +228,28 @@ static void manager_cb(lv_timer_t *t)
     // Ensure timer period matches current screen state
     manager_adjust_period();
 
-    // Optional: cheap "kick" when awake to avoid rare stuck refresh states
+    // Optional refresh kick to avoid “stuck black” if awake
     if (g_screen_awake) {
         static uint32_t last_kick = 0;
         if (tnow - last_kick > 1000) {
             last_kick = tnow;
             bsp_display_lock(0);
-            lv_refr_now(s_disp);
+            lv_refr_now(NULL);
             bsp_display_unlock();
         }
     }
 
-    // Debug heartbeat
-    static uint32_t last_dbg = 0;
-    if (tnow - last_dbg > 2000) {
-        last_dbg = tnow;
-        ESP_LOGI(TAG, "mgr alive idle=%u screen=%d touch_irq=%u pending=%d panel=%d te=%d",
-                 (unsigned)idle, (int)g_screen_awake,
-                 (unsigned)s_touch_irq_count, (int)s_touch_pending,
-                 (int)s_panel_on, (int)s_te_on);
-    }
+    // Debug (optional)
+    // static uint32_t last_dbg = 0;
+    // if (tnow - last_dbg > 2000) {
+    //     last_dbg = tnow;
+    //     ESP_LOGI(TAG, "mgr alive idle=%u screen=%d touch_irq=%u pending=%d eff=%d user=%d cap=%d",
+    //             (unsigned)idle, (int)g_screen_awake,
+    //             (unsigned)s_touch_irq_count, (int)s_touch_pending,
+    //             backlight_get_effective_pct(),
+    //             backlight_get_user_pct(),
+    //             backlight_get_cap_pct());
+    // }
 }
 
 /* ---------- Public API ---------- */
@@ -286,17 +257,13 @@ esp_err_t watch_sleep_init(void)
 {
     g_last_activity_ms = now_ms();
     s_disp = lv_disp_get_default();
+    (void)s_disp;
 
-    // Touch handle (created in display init)
+    // Use the BSP touch handle (created in display init)
     s_tp = bsp_display_get_touch();
     if (!s_tp) {
         ESP_LOGW(TAG, "Touch handle NULL; wake will not work via touch");
     }
-
-    // Assume we start with screen on
-    s_panel_on = true;
-    s_te_on    = true;
-    bsp_display_sync_gate(true);
 
     if (!s_mgr_timer) {
         s_mgr_timer = lv_timer_create(manager_cb, 50, NULL);
@@ -318,6 +285,7 @@ void watch_sleep_notify_activity(void)
     const uint32_t tnow = now_ms();
     g_last_activity_ms = tnow;
 
+    // Ensure we are awake immediately
     screen_wake_local();
     enter_stage(SLP_AWAKE);
 
@@ -332,6 +300,7 @@ void watch_sleep_force_awake(void)
 
 void watch_sleep_force_screen_off(void)
 {
+    // Force screen off immediately + apply sleep perf/radio profile
     screen_sleep_local();
     enter_stage(SLP_SCREEN_OFF);
 }

@@ -27,6 +27,7 @@ bool         watch_shutdown_low_power_latched(void);
 float watch_shutdown_get_critical_v(void);
 bool watch_shutdown_low_power_latched(void);
 void watch_shutdown_set_low_power_latch(bool on);
+bool watch_shutdown_storage_allowed(void);
 
 #ifdef __cplusplus
 }

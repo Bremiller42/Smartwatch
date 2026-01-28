@@ -25,6 +25,7 @@
 #include "esp_lcd_axs15231b.h"
 #include "bsp_err_check.h"
 #include "watch_sleep.h"
+#include "watch_globals.h"
 
 #include "lv_port.h"
 #include "display.h"
@@ -89,7 +90,6 @@ static esp_lcd_panel_handle_t panel_handle = NULL;
 static bool i2c_initialized = false;
 static TaskHandle_t s_te_task = NULL;
 static bool s_te_enabled = false;
-static volatile bool s_sync_gate_enabled = true;
 
 esp_err_t bsp_i2c_init(void)
 {
@@ -156,8 +156,8 @@ static esp_err_t bsp_display_brightness_init(void)
 
 esp_err_t bsp_display_brightness_set(int brightness_percent)
 {
-    if (brightness_percent > 100) {
-        brightness_percent = 100;
+    if (brightness_percent > backlight_max) {
+        brightness_percent = backlight_max;
     }
     if (brightness_percent < 0) {
         brightness_percent = 0;
@@ -178,16 +178,11 @@ esp_err_t bsp_display_backlight_off(void)
 
 esp_err_t bsp_display_backlight_on(void)
 {
-    return bsp_display_brightness_set(100);
+    return bsp_display_brightness_set(backlight_max);
 }
 
 static bool bsp_display_sync_cb(void *arg)
 {
-    // If we're "screen-off", LVGL must NOT block waiting for TE/vsync.
-    if (!s_sync_gate_enabled) {
-        return true;
-    }
-
     assert(arg);
     bsp_lcd_tear_t *tear_handle = (bsp_lcd_tear_t *)arg;
 
@@ -196,14 +191,11 @@ static bool bsp_display_sync_cb(void *arg)
     }
 
     if (tear_handle->te_v_sync_sem) {
-        // Wait for TE interrupt to release this (normal behavior while screen is on)
+
         xSemaphoreTake(tear_handle->te_v_sync_sem, portMAX_DELAY);
     }
-
     return true;
 }
-
-
 
 static void bsp_display_sync_task(void *arg)
 {
@@ -560,21 +552,15 @@ void bsp_display_te_pause(void)
 {
     if (!s_te_enabled) return;
     gpio_intr_disable(EXAMPLE_PIN_NUM_QSPI_TE);
-    // Do NOT suspend the task; it can keep draining the catch semaphore safely.
-    // Suspending can deadlock LVGL's draw_wait_cb semaphore handshake.
-}
-
-void bsp_display_sync_gate(bool enable)
-{
-    s_sync_gate_enabled = enable;
+    if (s_te_task) vTaskSuspend(s_te_task);
 }
 
 void bsp_display_te_resume(void)
 {
     if (!s_te_enabled) return;
+    if (s_te_task) vTaskResume(s_te_task);
     gpio_intr_enable(EXAMPLE_PIN_NUM_QSPI_TE);
 }
-
 
 void bsp_display_panel_on(bool on)
 {

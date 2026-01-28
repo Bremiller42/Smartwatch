@@ -1,3 +1,4 @@
+// FILE: src/watch_shutdown.c
 #include "watch_shutdown.h"
 
 #include "esp_log.h"
@@ -8,9 +9,9 @@
 #include "watch_globals.h"
 #include "watch_power.h"
 #include "watch_settings.h"
-
 #include "watch_wifi.h"
 #include "watch_ble.h"
+#include "watch_backlight.h"
 
 #include "lvgl.h"
 #include "ui_priv.h"
@@ -25,23 +26,25 @@ typedef struct {
     float shutdown_v;
     int   shutdown_confirm_ms;
     int   min_transition_ms;
-    int   dim_pct_low;
-    int   dim_pct_critical;
+    int   cap_pct_low;
+    int   cap_pct_critical;
 } shdn_cfg_t;
 
 static shdn_cfg_t s_cfg = {
-    .low_v              = 3.65f,
-    .low_exit_v         = 3.75f,
+    .low_v               = 3.65f,
+    .low_exit_v          = 3.75f,
 
-    .critical_v         = 3.50f,
-    .critical_exit_v    = 3.60f,
+    .critical_v          = 3.50f,
+    .critical_exit_v     = 3.60f,
 
-    .shutdown_v         = 3.35f,
+    .shutdown_v          = 3.35f,
     .shutdown_confirm_ms = 8000,
 
-    .min_transition_ms  = 2000,
-    .dim_pct_low        = 35,
-    .dim_pct_critical   = 10,
+    .min_transition_ms   = 2000,
+
+    // These are CAPS now, not “set brightness”
+    .cap_pct_low         = 35,
+    .cap_pct_critical    = 10,
 };
 
 static bool s_ready = false;
@@ -95,10 +98,12 @@ static void apply_low_actions(void)
     if (s_actions_applied_low) return;
     s_actions_applied_low = true;
 
-    ESP_LOGW(TAG, "LOW battery actions");
-    apply_backlight_percent(s_cfg.dim_pct_low);
-    (void)watch_power_set_profile_sleep();
+    ESP_LOGW(TAG, "LOW battery actions (cap=%d%%)", s_cfg.cap_pct_low);
 
+    // ✅ Cap brightness (does NOT change user preference)
+    backlight_set_cap_pct(s_cfg.cap_pct_low);
+
+    (void)watch_power_set_profile_sleep();
     lv_async_call(ui_warn_async, (void *)"LOW BATTERY");
 }
 
@@ -110,9 +115,10 @@ static void apply_critical_actions(void)
     /* ✅ latch critical UI state */
     watch_shutdown_set_low_power_latch(true);
 
-    ESP_LOGE(TAG, "CRITICAL battery actions");
-    apply_backlight_percent(s_cfg.dim_pct_critical);
-    (void)watch_power_set_profile_sleep();
+    ESP_LOGE(TAG, "CRITICAL battery actions (cap=%d%%)", s_cfg.cap_pct_critical);
+
+    // ✅ Cap brightness more aggressively
+    backlight_set_cap_pct(s_cfg.cap_pct_critical);
 
     /* ✅ show low power screen as “last screen” */
     lv_async_call(ui_show_low_pwr_async, NULL);
@@ -121,6 +127,7 @@ static void apply_critical_actions(void)
     wifi_stop();
     ble_set_enabled(false);
 
+    ESP_LOGW(TAG, "Unmount SD to prevent write current spikes");
     lv_async_call(ui_warn_async, (void *)"CRITICAL BATTERY");
 }
 
@@ -134,6 +141,12 @@ static void enter_deep_sleep(void)
 {
     ESP_LOGW(TAG, "Entering deep sleep due to low VBAT");
     esp_deep_sleep_start();
+}
+
+bool watch_shutdown_storage_allowed(void)
+{
+    if (watch_shutdown_low_power_latched()) return false;
+    return (s_state == SHDN_OK || s_state == SHDN_LOW);
 }
 
 /* ---------------- API ---------------- */
@@ -181,6 +194,9 @@ void watch_shutdown_update(float vbat, bool screen_awake)
                 s_state = SHDN_LOW;
                 s_last_transition_ms = t;
                 apply_low_actions();
+            } else {
+                // Normal: ensure cap is relaxed
+                backlight_set_cap_pct(100);
             }
             break;
 
@@ -193,8 +209,10 @@ void watch_shutdown_update(float vbat, bool screen_awake)
                 s_actions_applied_low = false;
                 s_actions_applied_critical = false;
 
-                /* optional: also clear latch if you want recovery to restore normal boot */
                 watch_shutdown_set_low_power_latch(false);
+
+                // ✅ restore cap on recovery
+                backlight_set_cap_pct(100);
                 break;
             }
 
@@ -211,8 +229,10 @@ void watch_shutdown_update(float vbat, bool screen_awake)
                 s_state = SHDN_LOW;
                 s_last_transition_ms = t;
 
-                /* ✅ clear latch once recovered enough */
                 watch_shutdown_set_low_power_latch(false);
+
+                // ✅ relax cap up to LOW cap (still protective)
+                backlight_set_cap_pct(s_cfg.cap_pct_low);
             }
 
             if (s_below_shutdown_since_ms > 0 &&

@@ -110,3 +110,6 @@ ui_screen_t g_ui_current = (ui_screen_t)-1;
 volatile sleep_stage_t g_sleep_stage = SLP_AWAKE;
 
 volatile settings_dirty_t g_settings_dirty = {0};
+
+int  backlight_max = 100;
+

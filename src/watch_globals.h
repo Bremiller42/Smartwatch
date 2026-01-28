@@ -180,3 +180,5 @@ typedef struct {
 } settings_dirty_t;
 
 extern volatile settings_dirty_t g_settings_dirty;
+
+extern int  backlight_max;
