@@ -33,6 +33,7 @@
 
 static const char *TAG = "DISPLAY";
 static esp_lcd_panel_handle_t s_panel = NULL;
+static volatile bool s_sync_gate_enabled = true;  // default ON
 
 static const axs15231b_lcd_init_cmd_t lcd_init_cmds[] = {
     {0xBB, (uint8_t []){0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5A, 0xA5}, 8, 0},
@@ -181,34 +182,64 @@ esp_err_t bsp_display_backlight_on(void)
     return bsp_display_brightness_set(backlight_max);
 }
 
+void bsp_display_sync_gate(bool enable)
+{
+    s_sync_gate_enabled = enable;
+
+    bsp_lcd_tear_t *tear = (bsp_lcd_tear_t *)(panel_handle ? panel_handle->user_data : NULL);
+    if (tear && tear->te_v_sync_sem) {
+        // Drain then give once (counting sem max=1).
+        (void)xSemaphoreTake(tear->te_v_sync_sem, 0);
+        if (!enable) {
+            xSemaphoreGive(tear->te_v_sync_sem);
+        }
+    }
+}
+
+
 static bool bsp_display_sync_cb(void *arg)
 {
     assert(arg);
     bsp_lcd_tear_t *tear_handle = (bsp_lcd_tear_t *)arg;
 
+    // If TE sync is gated OFF or TE not enabled, never wait.
+    if (!s_sync_gate_enabled || !s_te_enabled) {
+        return true;
+    }
+
+    // Signal "about to flush" (sync task uses this)
     if (tear_handle->te_catch_sem) {
         xSemaphoreGive(tear_handle->te_catch_sem);
     }
 
+    // Never block forever. If TE edge doesn't arrive quickly, just continue.
     if (tear_handle->te_v_sync_sem) {
-
-        xSemaphoreTake(tear_handle->te_v_sync_sem, portMAX_DELAY);
+        (void)xSemaphoreTake(tear_handle->te_v_sync_sem, pdMS_TO_TICKS(30));
     }
+
     return true;
 }
 
 static void bsp_display_sync_task(void *arg)
 {
     assert(arg);
-    bsp_lcd_tear_t *tear_handle = (bsp_lcd_tear_t *)arg;
+    bsp_lcd_tear_t *tear = (bsp_lcd_tear_t *)arg;
 
     while (true) {
-        if (pdPASS != xSemaphoreTake(tear_handle->te_catch_sem, pdMS_TO_TICKS(tear_handle->time_Tvdl))) {
-            xSemaphoreTake(tear_handle->te_v_sync_sem, 0);
+        // Wait until LVGL is about to flush (sync cb gives this)
+        if (xSemaphoreTake(tear->te_catch_sem, portMAX_DELAY) == pdTRUE) {
+
+            // If gated off, don't do anything
+            if (!s_sync_gate_enabled || !s_te_enabled) {
+                continue;
+            }
+
+            // Wait for the next TE edge (but not forever)
+            (void)xSemaphoreTake(tear->te_v_sync_sem, pdMS_TO_TICKS(30));
         }
     }
-    vTaskDelete(NULL);
 }
+
 
 static void bsp_display_tear_interrupt(void *arg)
 {
@@ -353,38 +384,68 @@ static lv_disp_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
     assert(cfg != NULL);
     esp_lcd_panel_io_handle_t io_handle = NULL;
 
-    uint32_t hres;
-    uint32_t vres;
+    uint32_t hres = EXAMPLE_LCD_QSPI_H_RES; // 320
+    uint32_t vres = EXAMPLE_LCD_QSPI_V_RES; // 480
+
+    // --------------------------
+    // Tune these (safe defaults)
+    // --------------------------
+    // trans buffers are ALWAYS MALLOC_CAP_DMA in lv_port.c, so keep them small.
+    // 320 * 20 px @ RGB565 ~= 12.8KB per DMA buf (two bufs ~= 25.6KB internal)
+    const uint32_t TRANS_ROWS_90_270 = 20;
+
+    // Decide if we actually need the trans/rotate path
+    const bool need_trans =
+        (cfg->rotate == LV_DISP_ROT_90) || (cfg->rotate == LV_DISP_ROT_270);
+
+    // trans_size is in PIXELS (lv_color_t units), not bytes
+    uint32_t trans_px = 0;
+    if (need_trans) {
+        trans_px = hres * TRANS_ROWS_90_270;
+        // clamp: never exceed a full frame just in case
+        if (trans_px > (hres * vres)) trans_px = (hres * vres);
+    } else {
+        trans_px = 0; // NONE/180: do not allocate DMA trans buffers
+    }
+
+    // max_transfer_sz should reflect your biggest single transfer.
+    // Use the larger of LVGL draw buffer (cfg->buffer_size) and trans chunk.
+    uint32_t lvgl_buf_bytes = cfg->buffer_size * sizeof(lv_color_t);
+    uint32_t trans_bytes    = trans_px * sizeof(lv_color_t);
+    uint32_t max_xfer_bytes = (lvgl_buf_bytes > trans_bytes) ? lvgl_buf_bytes : trans_bytes;
+
+    // small padding for driver overhead / alignment
+    max_xfer_bytes += 4096;
 
     /**
-    * If the transmission time exceeds the refresh period (time_Tvdl), adopt a 2x period,
-    * and start data transmission at the falling edge.
-    */
-    hres = EXAMPLE_LCD_QSPI_H_RES;
-    vres = EXAMPLE_LCD_QSPI_V_RES;
+     * If the transmission time exceeds the refresh period (time_Tvdl), adopt a 2x period,
+     * and start data transmission at the falling edge.
+     */
     const bsp_display_config_t bsp_disp_cfg = {
-        .max_transfer_sz = hres * vres * sizeof(uint16_t),
+        .max_transfer_sz = max_xfer_bytes,
         .tear_cfg = BSP_SYNC_TASK_CONFIG(EXAMPLE_PIN_NUM_QSPI_TE, GPIO_INTR_NEGEDGE),
     };
+
     bsp_display_new(&bsp_disp_cfg, &panel_handle, &io_handle);
 
     /* Add LCD screen */
     ESP_LOGD(TAG, "Add LCD screen");
     lvgl_port_display_cfg_t disp_cfg = {
-        .io_handle = io_handle,
-        .panel_handle = panel_handle,
-        .buffer_size = cfg->buffer_size,
-        .sw_rotate = cfg->rotate,
-        .hres = hres,
-        .vres = vres,
-        .trans_size = hres * vres / 10,
-        .draw_wait_cb = bsp_display_sync_cb,
+        .io_handle     = io_handle,
+        .panel_handle  = panel_handle,
+        .buffer_size   = cfg->buffer_size,
+        .sw_rotate     = cfg->rotate,
+        .hres          = hres,
+        .vres          = vres,
+        .trans_size    = trans_px,
+        .draw_wait_cb  = bsp_display_sync_cb,
         .flags = {
-            .buff_dma = false,
-            .buff_spiram = true,
+            .buff_dma    = false,
+            .buff_spiram = true,   // LVGL draw buffer in PSRAM
         },
     };
 
+    // LVGL driver expects swapped res when rotating 90/270
     if (disp_cfg.sw_rotate == LV_DISP_ROT_180 || disp_cfg.sw_rotate == LV_DISP_ROT_NONE) {
         disp_cfg.hres = hres;
         disp_cfg.vres = vres;
@@ -393,8 +454,16 @@ static lv_disp_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
         disp_cfg.vres = hres;
     }
 
+    ESP_LOGI(TAG,
+             "disp init: rotate=%d buf_px=%u (PSRAM) trans_px=%u (DMA) max_xfer=%u bytes",
+             (int)cfg->rotate,
+             (unsigned)cfg->buffer_size,
+             (unsigned)disp_cfg.trans_size,
+             (unsigned)max_xfer_bytes);
+
     return lvgl_port_add_disp(&disp_cfg);
 }
+
 
 static bool bsp_touch_sync_cb(void *arg)
 {
@@ -551,6 +620,10 @@ lv_disp_t *bsp_display_start_with_config(const bsp_display_cfg_t *cfg)
 void bsp_display_te_pause(void)
 {
     if (!s_te_enabled) return;
+
+    // CRITICAL: stop LVGL from waiting on TE before we kill the TE source
+    bsp_display_sync_gate(false);
+
     gpio_intr_disable(EXAMPLE_PIN_NUM_QSPI_TE);
     if (s_te_task) vTaskSuspend(s_te_task);
 }
@@ -558,9 +631,20 @@ void bsp_display_te_pause(void)
 void bsp_display_te_resume(void)
 {
     if (!s_te_enabled) return;
+
     if (s_te_task) vTaskResume(s_te_task);
     gpio_intr_enable(EXAMPLE_PIN_NUM_QSPI_TE);
+
+    // PRIME: ensure next flush can't deadlock waiting for the first TE edge
+    bsp_lcd_tear_t *tear = (bsp_lcd_tear_t *)(panel_handle ? panel_handle->user_data : NULL);
+    if (tear && tear->te_v_sync_sem) {
+        xSemaphoreGive(tear->te_v_sync_sem);
+    }
+
+    // Allow TE-based waiting again
+    bsp_display_sync_gate(true);
 }
+
 
 void bsp_display_panel_on(bool on)
 {

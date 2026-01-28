@@ -6,6 +6,7 @@
 #include "watch_time.h"
 #include "watch_settings.h"
 #include "watch_audio.h"
+#include "watch_weather.h"
 
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -138,6 +139,7 @@ static void wifi_event_handler(void *arg,
 
         // Time sync
         sntp_start();
+
         return;
     }
 

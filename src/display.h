@@ -152,6 +152,9 @@ void bsp_display_panel_on(bool on);
 esp_lcd_touch_handle_t bsp_display_get_touch(void);
 // NEW: gate LVGL's draw_wait_cb so LVGL won't block when TE is disabled/panel is off
 void bsp_display_sync_gate(bool enable);
+static volatile bool s_sync_gate_enabled;
+
+
 
 #ifdef __cplusplus
 }

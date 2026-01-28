@@ -4,6 +4,9 @@
 #include "watch_heartrate.h"
 #include "ui_color_pallete.h"
 #include "watch_fuel.h"
+#include "watch_weather.h"
+#include "watch_icons/watch_icons.h"
+
 static const char *UI_SC_TAG = "UI_CLOCK";
 
 static lv_obj_t *hr_btn = NULL;
@@ -11,12 +14,91 @@ static lv_obj_t *hr_btn_icon = NULL;
 static lv_obj_t *hr_status_lbl = NULL;
 static lv_obj_t *hr_bpm_lbl    = NULL;
 static lv_obj_t *hr_prog_arc   = NULL;
+static lv_obj_t *wx_temp_lbl = NULL;
+static lv_obj_t *wx_hum_lbl  = NULL;
+static lv_obj_t *wx_icon_main = NULL;  // lv_img
+static lv_obj_t *wx_icon_wind = NULL;  // lv_img
 
-
+static bool s_wx_cb_registered = false;
 
 static void on_back_to_home(lv_event_t * e)
 {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) ui_show(UI_HOME);
+}
+static const void *wx_icon_for_condition(int cond_id, bool is_day)
+{
+    // OpenWeather condition buckets:
+    // 2xx thunder, 3xx drizzle, 5xx rain, 6xx snow, 7xx atmosphere, 800 clear, 80x clouds
+    if (cond_id >= 200 && cond_id <= 232) return &icon_cloud_bolt_solid_42;
+    if (cond_id >= 300 && cond_id <= 321) return &icon_cloud_rain_solid_42;          // drizzle -> rain icon
+    if (cond_id >= 500 && cond_id <= 531) return &icon_cloud_rain_solid_42;
+    if (cond_id >= 600 && cond_id <= 622) return &icon_snowflake_solid_42;
+    if (cond_id >= 700 && cond_id <= 781) return &icon_wind_solid_42;                // fog/dust -> wind-ish icon
+    if (cond_id == 800) {
+        return is_day ? (const void*)&icon_sun_solid_42 : (const void*)&icon_moon_regular_42;
+    }
+    if (cond_id >= 801 && cond_id <= 804) return &icon_cloud_solid_42;
+
+    // fallback
+    return &icon_cloud_regular_42;
+}
+
+static bool wx_is_windy_mph10(int wind_mps_x10)
+{
+    // 10 mph = 4.4704 m/s -> 44.704 in (m/s * 10)
+    const int threshold_mps_x10 = 45;
+    return wind_mps_x10 >= threshold_mps_x10;
+}
+static void wx_refresh_async(void *arg)
+{
+    (void)arg;
+
+    weather_snapshot_t s;
+    if (!weather_get_latest(&s) || !s.valid) {
+        if (wx_temp_lbl) lv_label_set_text(wx_temp_lbl, "--");
+        if (wx_hum_lbl)  lv_label_set_text(wx_hum_lbl,  "--");
+        if (wx_icon_main) lv_img_set_src(wx_icon_main, &icon_cloud_regular_42);
+        if (wx_icon_wind) lv_obj_add_flag(wx_icon_wind, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    // Temp: show in F if configured
+    int temp_x10 = s.temp_c_x10;
+    char unit = 'C';
+    if (weather_get_use_fahrenheit()) {
+        temp_x10 = (s.temp_c_x10 * 9) / 5 + 320;
+        unit = 'F';
+    }
+
+    char tbuf[24];
+    snprintf(tbuf, sizeof(tbuf), "%d.%d%c", temp_x10 / 10, abs(temp_x10 % 10), unit);
+
+    char hbuf[24];
+    snprintf(hbuf, sizeof(hbuf), "%d%%", s.humidity_pct);
+
+    if (wx_temp_lbl) lv_label_set_text(wx_temp_lbl, tbuf);
+    if (wx_hum_lbl)  lv_label_set_text(wx_hum_lbl,  hbuf);
+
+    // Main icon
+    if (wx_icon_main) {
+        const void *src = wx_icon_for_condition(s.condition_id, s.is_day);
+        lv_img_set_src(wx_icon_main, src);
+    }
+
+    // Wind icon toggle
+    if (wx_icon_wind) {
+        if (wx_is_windy_mph10(s.wind_mps_x10)) {
+            lv_obj_clear_flag(wx_icon_wind, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(wx_icon_wind, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void wx_on_weather_update_cb(const weather_snapshot_t *snap)
+{
+    (void)snap;
+    lv_async_call(wx_refresh_async, NULL);
 }
 
 static void on_hr_read_now(lv_event_t *e)
@@ -177,11 +259,57 @@ lv_obj_t *ui_build_clock_screen(void)
     lv_obj_add_event_cb(menu, on_back_to_home, LV_EVENT_CLICKED, NULL);
     lv_label_set_text(lv_label_create(menu), LV_SYMBOL_HOME);
     lv_obj_center(lv_obj_get_child(menu, 0));
-    
+
+        // ---- Weather block (top-right) ----
+    // ---- Weather block (anchored under HR button) ----
+    wx_icon_main = lv_img_create(scr);
+    lv_img_set_src(wx_icon_main, &icon_cloud_regular_42);
+
+    // Place weather icon under the HR button, right-aligned with it.
+    // Tweak x/y to taste.
+    lv_obj_align_to(wx_icon_main, hr_btn, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
+
+    wx_icon_wind = lv_img_create(scr);
+    lv_img_set_src(wx_icon_wind, &icon_wind_solid_42);
+    lv_obj_align_to(wx_icon_wind, wx_icon_main, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+    lv_obj_add_flag(wx_icon_wind, LV_OBJ_FLAG_HIDDEN);
+
+    wx_temp_lbl = lv_label_create(scr);
+    lv_obj_set_style_text_font(wx_temp_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(wx_temp_lbl, UI_COLOR(WHITE), 0);
+    lv_label_set_text(wx_temp_lbl, "--");
+
+    // Temp just under the main weather icon
+    lv_obj_align_to(wx_temp_lbl, wx_icon_main, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
+
+    wx_hum_lbl = lv_label_create(scr);
+    lv_obj_set_style_text_font(wx_hum_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wx_hum_lbl, UI_COLOR(THEME), 0);
+    lv_obj_set_style_text_opa(wx_hum_lbl, LV_OPA_80, 0);
+    lv_label_set_text(wx_hum_lbl, "--");
+
+    // Humidity under temp
+    lv_obj_align_to(wx_hum_lbl, wx_temp_lbl, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
+
+
     ui_set_watch_batt(g_watch_batt_pct, g_watch_batt_v);
     clock_update_label_now();
     clock_update_wifi_icon_now();
     clock_update_ble_icon_now();
+
+        // Register weather update callback once
+    if (!s_wx_cb_registered) {
+        weather_register_cb(wx_on_weather_update_cb);
+        s_wx_cb_registered = true;
+    }
+
+    // Show whatever we currently have (cached)
+    lv_async_call(wx_refresh_async, NULL);
+
+    // Also request a fresh update now that the clock screen exists
+    // (it will be throttled by your min_refresh anyway)
+    weather_request_update();
+
     ui_notif_bar_attach(scr);
     ui_hr_widget_refresh_request();
     ui_set_watch_batt(g_watch_batt_pct, g_watch_batt_v);

@@ -6,6 +6,7 @@
 #include "watch_settings.h"
 #include "watch_globals.h"
 #include "watch_heartrate.h"
+#include "watch_weather.h"
 
 static const char *UI_SS_TAG = "UI_SETTINGS";
 
@@ -13,6 +14,8 @@ static const char *UI_SS_TAG = "UI_SETTINGS";
 static lv_obj_t *timeout_sub_lbl    = NULL;
 static lv_obj_t *always_on_sub_lbl  = NULL;
 static lv_obj_t *hr_period_sub_lbl  = NULL;
+static lv_obj_t *weather_sub_lbl = NULL;
+
 static lv_obj_t *t_always_on = NULL;
 
 /* ---- Timeout tile helpers ---- */
@@ -22,6 +25,69 @@ static uint32_t timeout_get_s(void)
     if (s != 15 && s != 30 && s != 60) s = 15;
     return s;
 }
+static void weather_update_subtitle(void)
+{
+    if (!weather_sub_lbl) return;
+
+    weather_diag_t d;
+    if (!weather_get_diag(&d)) {
+        lv_label_set_text(weather_sub_lbl, "Unavailable");
+        return;
+    }
+
+    if (d.inflight) {
+        lv_label_set_text(weather_sub_lbl, "Updating...");
+        return;
+    }
+
+    if (d.valid) {
+        lv_label_set_text(weather_sub_lbl, "Connected");
+        return;
+    }
+
+    // Not valid -> show something useful
+    if (!d.loc_ok) {
+        lv_label_set_text(weather_sub_lbl, "No location");
+        return;
+    }
+
+    if (d.last_http_err != 0) {
+        // show esp_err name if you want; keep short here
+        lv_label_set_text(weather_sub_lbl, "HTTP error");
+        return;
+    }
+
+    if (d.last_http_status != 0 && (d.last_http_status < 200 || d.last_http_status >= 300)) {
+        static char buf[24];
+        snprintf(buf, sizeof(buf), "HTTP %d", d.last_http_status);
+        lv_label_set_text(weather_sub_lbl, buf);
+        return;
+    }
+
+    lv_label_set_text(weather_sub_lbl, "Not updated");
+}
+
+static void weather_update_subtitle_async(void *arg)
+{
+    (void)arg;
+    weather_update_subtitle();
+}
+
+
+static void on_weather_tile_clicked(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    weather_request_update();
+    weather_update_subtitle();
+    mark_user_activity();
+}
+
+static void wx_settings_diag_cb(const weather_snapshot_t *snap)
+{
+    (void)snap;
+    lv_async_call(weather_update_subtitle_async, NULL);
+}
+
 
 static void timeout_update_subtitle(void)
 {
@@ -183,6 +249,12 @@ static void on_time_format_changed(lv_event_t *e)
     mark_user_activity();
 }
 
+static void on_open_device_info(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    ui_show(UI_DEVICE_INFO);
+}
+
 static void on_wifi_toggle(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
@@ -264,6 +336,7 @@ lv_obj_t *ui_build_settings_screen(void)
     lv_obj_t *tab_display = lv_tabview_add_tab(tv, "Display");
     lv_obj_t *tab_network = lv_tabview_add_tab(tv, "Network");
     lv_obj_t *tab_time    = lv_tabview_add_tab(tv, "Time/Date");
+    lv_obj_t *tab_about   = lv_tabview_add_tab(tv, "About");
 
     static lv_coord_t col_dsc[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST };
     static lv_coord_t row_dsc[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST };
@@ -329,6 +402,13 @@ lv_obj_t *ui_build_settings_screen(void)
     ble_status_lbl = ble_sub;
     lv_async_call(ui_update_ble_status_async, NULL);
 
+    lv_obj_t *t_weather = tile_create_base(g_net, "Weather", "", &weather_sub_lbl);
+    tile_set_on(t_weather, true);
+    lv_obj_set_grid_cell(t_weather, LV_GRID_ALIGN_CENTER, 2, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+    weather_register_cb(wx_settings_diag_cb);
+    weather_update_subtitle();
+    lv_obj_add_event_cb(t_weather, on_weather_tile_clicked, LV_EVENT_CLICKED, NULL);
+
     lv_obj_t *t_notif = tile_create_nav_tile(g_net, "Notifications", "Coming soon", NULL);
     lv_obj_set_grid_cell(t_notif, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 1, 1);
 
@@ -379,6 +459,29 @@ lv_obj_t *ui_build_settings_screen(void)
     lv_label_set_text(btxt, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(btxt, lv_color_white(), 0);
     lv_obj_center(btxt);
+    
+    // ABOUT GRID
+    lv_obj_t *g_about = lv_obj_create(tab_about);
+    lv_obj_set_size(g_about, lv_pct(100), lv_pct(100));
+    lv_obj_center(g_about);
+    lv_obj_set_style_bg_opa(g_about, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(g_about, 0, 0);
+    lv_obj_set_style_pad_all(g_about, 14, 0);
+    lv_obj_set_style_pad_row(g_about, 14, 0);
+    lv_obj_set_style_pad_column(g_about, 14, 0);
+    lv_obj_clear_flag(g_about, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_grid_dsc_array(g_about, col_dsc, row_dsc);
+
+    lv_obj_t *t_devinfo = tile_create_nav_tile(g_about, "Device Info", "CPU / RAM / Battery", on_open_device_info);
+    lv_obj_set_grid_cell(t_devinfo, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+
+    lv_obj_t *t_fw = tile_create_base(g_about, "Firmware", "Next", NULL);
+    tile_set_on(t_fw, false);
+    lv_obj_set_grid_cell(t_fw, LV_GRID_ALIGN_CENTER, 1, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+
+    lv_obj_t *t_licenses = tile_create_base(g_about, "Licenses", "Later", NULL);
+    tile_set_on(t_licenses, false);
+    lv_obj_set_grid_cell(t_licenses, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 1, 1);
 
     return scr;
 }

@@ -35,6 +35,8 @@
 #include "watch_sdcard.h"
 #include "watch_boot_guard.h"
 #include "watch_backlight.h"
+#include "watch_weather.h"
+#include "watch_debug.h"
 
 static const char *MAIN_TAG = "SmartWatch";
 
@@ -250,11 +252,16 @@ void setup(void)
     time_set_timezone();
     time_restore_last_known();
 
+    weather_init();
+    
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
     settings_load_hr_current_into_ui();
 
     LOG_SECTION("Bring up services");
     bringup_services();
+
+    // Debug touch interrupt monitoring task
+    // xTaskCreate(touch_int_debug_task, "touch_int_dbg", 2048, NULL, 1, NULL);
 
     watch_audio_beep(880,  60);
     watch_audio_beep(1320, 50);
@@ -263,5 +270,5 @@ void setup(void)
 
 void loop(void)
 {
-    // No Arduino loop used (ESP-IDF tasks drive everything)
+
 }

@@ -63,6 +63,15 @@ void ui_show(ui_screen_t s)
         if (!scr_low_pwr) scr_low_pwr = ui_build_low_pwr_screen();
         lv_scr_load(scr_low_pwr);
     }
+    else if (s == UI_DEVICE_INFO) {
+        if (ui_device_info) {
+            lv_obj_del(ui_device_info);
+            ui_device_info = NULL;
+        }
+        ui_device_info = ui_build_device_info_screen();
+        lv_scr_load(ui_device_info);
+    }
+
     g_ui_current = s;
 }
 

@@ -105,3 +105,4 @@ void log_screen_refresh(lv_timer_t *t);
 void ui_log_screen_pause(bool pause);
 lv_obj_t *ui_build_power_menu(void);
 lv_obj_t *ui_build_low_pwr_screen(void);
+lv_obj_t *ui_build_device_info_screen(void);

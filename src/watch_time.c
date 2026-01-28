@@ -1,6 +1,7 @@
 #include "watch_time.h"
 #include "watch_globals.h"
 #include "watch_audio.h"
+#include "watch_weather.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sntp.h"
@@ -23,6 +24,8 @@ static void time_sync_notification_cb(struct timeval *tv)
 
     time_save_last_known();
     lv_async_call(ui_update_clock_async, NULL);
+    weather_request_update();
+
 }
 
 void time_set_timezone(void)

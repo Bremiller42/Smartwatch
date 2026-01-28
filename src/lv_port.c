@@ -146,12 +146,20 @@ esp_err_t lvgl_port_pause(void)
 {
     if (!lvgl_port_ctx.tick_timer || !lvgl_port_ctx.eg) return ESP_ERR_INVALID_STATE;
 
+    // Block LVGL task quickly
+    lvgl_port_ctx.paused = true;
+    xEventGroupSetBits(lvgl_port_ctx.eg, LVGL_EG_BIT_WAKE);
+
+    // Stop tick first so time doesn't advance during shutdown
     esp_err_t e1 = esp_timer_stop(lvgl_port_ctx.tick_timer);
     ESP_LOGI(TAG, "pause: esp_timer_stop=%s", esp_err_to_name(e1));
 
-    lv_timer_enable(false);
-    lvgl_port_ctx.paused = true;
-    xEventGroupSetBits(lvgl_port_ctx.eg, LVGL_EG_BIT_WAKE);
+    // Disable LVGL timers safely
+    if (lvgl_port_lock(0)) {
+        lv_timer_enable(false);
+        lvgl_port_unlock();
+    }
+
     return ESP_OK;
 }
 
@@ -159,16 +167,22 @@ esp_err_t lvgl_port_resume(void)
 {
     if (!lvgl_port_ctx.tick_timer || !lvgl_port_ctx.eg) return ESP_ERR_INVALID_STATE;
 
-    lvgl_port_ctx.paused = false;
-    lv_timer_enable(true);
+    // Re-enable LVGL timers safely
+    if (lvgl_port_lock(0)) {
+        lv_timer_enable(true);
+        lvgl_port_unlock();
+    }
 
+    // Restart tick
     esp_err_t e2 = esp_timer_start_periodic(lvgl_port_ctx.tick_timer, lvgl_port_timer_period_ms * 1000);
     ESP_LOGI(TAG, "resume: esp_timer_start_periodic=%s", esp_err_to_name(e2));
 
+    // Let task run again
+    lvgl_port_ctx.paused = false;
     xEventGroupSetBits(lvgl_port_ctx.eg, LVGL_EG_BIT_WAKE);
+
     return ESP_OK;
 }
-
 
 esp_err_t lvgl_port_stop(void)
 {
