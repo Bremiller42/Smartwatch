@@ -1,6 +1,7 @@
 // FILE: src/ui/ui_tiles.c
 #include "ui_priv.h"
 #include "esp_log.h"
+#include "ui_color_pallete.h"
 static const char *UI_TIL_TAG = "UI_TILES";
 
 #define TILE_W   130
@@ -8,8 +9,6 @@ static const char *UI_TIL_TAG = "UI_TILES";
 #define TILE_RAD 13
 
 static lv_color_t TILE_OFF_BG(void) { return lv_color_hex(0x2A2A2A); }
-static lv_color_t TILE_ON_BG(void)  { return lv_color_hex(0x1E6BFF); }
-static lv_color_t TILE_BORDER(void) { return lv_color_hex(0x3A3A3A); }
 
 typedef struct {
     lv_obj_t *tile_btn;
@@ -20,16 +19,16 @@ typedef struct {
 static void tile_style_base(lv_obj_t *btn)
 {
     lv_obj_set_style_radius(btn, TILE_RAD, 0);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_70, 0);
     lv_obj_set_style_border_width(btn, 2, 0);
-    lv_obj_set_style_border_color(btn, TILE_BORDER(), 0);
+    lv_obj_set_style_border_color(btn, UI_COLOR(THEME), 0);
     lv_obj_set_style_pad_all(btn, 12, 0);
     lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
 }
 
 void tile_set_on(lv_obj_t *btn, bool on)
 {
-    lv_obj_set_style_bg_color(btn, on ? TILE_ON_BG() : TILE_OFF_BG(), 0);
+    lv_obj_set_style_bg_color(btn, on ? UI_COLOR(THEME) : TILE_OFF_BG(), 0);
 }
 
 lv_obj_t *tile_create_base(lv_obj_t *parent, const char *title, const char *subtitle, lv_obj_t **out_sub_lbl)
@@ -41,12 +40,12 @@ lv_obj_t *tile_create_base(lv_obj_t *parent, const char *title, const char *subt
 
     lv_obj_t *t = lv_label_create(btn);
     lv_label_set_text(t, title ? title : "");
-    lv_obj_set_style_text_color(t, lv_color_white(), 0);
+    lv_obj_set_style_text_color(t, UI_COLOR(BLACK), 0);
     lv_obj_align(t, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *s = lv_label_create(btn);
     lv_label_set_text(s, subtitle ? subtitle : "");
-    lv_obj_set_style_text_color(s, lv_color_white(), 0);
+    lv_obj_set_style_text_color(s, UI_COLOR(BLACK), 0);
     lv_obj_set_style_text_opa(s, LV_OPA_80, 0);
     lv_obj_align(s, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 

@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdlib.h>
+#include "watch_screen_timeout.h"
 
 #define MAX30102_ADDR           0x57
 static const char *HR_TAG = "HEART";
@@ -34,6 +35,7 @@ uint32_t g_hr_period_ms = 0;   // default: every 60 seconds
 #ifndef HR_LOG_RAW_EVERY_MS
 #define HR_LOG_RAW_EVERY_MS  200
 #endif
+static int s_hr_to_token = -1;
 
 static uint32_t HR_AC_MIN = 30;     // wrist often low amplitude
 static uint32_t HR_DC_MIN = 20000;
@@ -99,6 +101,17 @@ void hr_get_ui_status(hr_ui_status_t *out)
     portENTER_CRITICAL(&s_ui_mux);
     *out = s_ui;
     portEXIT_CRITICAL(&s_ui_mux);
+}
+static void heart_enter_always_on(void)
+{
+    screen_keep_awake_acquire();
+    screen_timeout_mark_activity();
+}
+
+static void heart_exit_always_on(void)
+{
+    screen_keep_awake_release();
+    screen_timeout_mark_activity();
 }
 
 /* Put sensor into low-power shutdown */
@@ -317,7 +330,9 @@ static void hr_process_sample(hr_est_t *h, ppg_filter_t *f, float ac, uint32_t n
 void hr_request_read_now(void)
 {
     if (s_hr_task) {
+        heart_enter_always_on();
         xTaskNotifyGive(s_hr_task);
+
     }
 }
 
@@ -328,6 +343,7 @@ static void max_task(void *arg)
 {
     (void)arg;
     s_hr_task = xTaskGetCurrentTaskHandle();
+
 
     // init I2C once
     esp_err_t err = watch_i2c_init();
@@ -381,6 +397,8 @@ static void max_task(void *arg)
             uint32_t tms = esp_log_timestamp();
             if (tms - last_warn_ms > 3000) {
                 last_warn_ms = tms;
+                heart_exit_always_on();
+
                 ESP_LOGW(HR_TAG, "MAX not present (init: %s). Will retry.", esp_err_to_name(err));
             }
 
@@ -424,6 +442,7 @@ static void max_task(void *arg)
         float bpm_samples[32];
         int bpm_n = 0;
         uint32_t start_ms = esp_log_timestamp();
+        uint32_t next_ui_ms = esp_log_timestamp();   // next time we’re allowed to poke UI
 
         for (;;) {
             // end conditions:
@@ -435,6 +454,15 @@ static void max_task(void *arg)
             err = max30102_read_sample(&s);
             if (err != ESP_OK) {
                 s_max_present = false;
+                    portENTER_CRITICAL(&s_ui_mux);
+                    s_ui.state = HR_STATE_ERROR;      // or HR_STATE_IDLE if you prefer
+                    s_ui.bpm_valid = false;
+                    s_ui.bpm_current = 0;
+                    portEXIT_CRITICAL(&s_ui_mux);
+
+                
+                ui_hr_widget_refresh_request(); // immediate on error
+                heart_exit_always_on();
                 ESP_LOGW(HR_TAG, "read failed: %s", esp_err_to_name(err));
                 break;
             }
@@ -504,22 +532,32 @@ static void max_task(void *arg)
                     s_ui.session_ms_elapsed = session_total_ms;
                     portEXIT_CRITICAL(&s_ui_mux);
                     settings_save_hr_current(bpm_final, (bpm_final > 0.1f));
-
+                    
+                    ui_hr_widget_refresh_request();
 
                     break;
                 }
             }
 
             // UI refresh
-            ui_hr_widget_refresh_request();
+            // UI refresh (throttled to ~6-7 Hz)
+            uint32_t t_ui = esp_log_timestamp();
+            if ((int32_t)(t_ui - next_ui_ms) >= 0) {
+                ui_hr_widget_refresh_request();
+                next_ui_ms = t_ui + 150;   // 150ms
+            }
 
             vTaskDelay(pdMS_TO_TICKS(20));
         }
-        
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        heart_exit_always_on();
+
         // END WINDOW: shutdown sensor to save power
         max30102_shutdown_best_effort();
         ESP_LOGI(HR_TAG, "HR window complete");
     } // ✅ closes while(1)
+       
+
 }     // ✅ closes max_task()
 
 

@@ -21,6 +21,8 @@ typedef struct {
     int      wind_mps_x10;     // wind speed (m/s) * 10
     bool     is_day;           // computed from dt vs sunrise/sunset
     uint32_t updated_ms;       // esp_timer_get_time()/1000 at fetch time
+    char     icon_code[4]; // 3 chars + '\0'
+
 } weather_snapshot_t;
 
 typedef struct {

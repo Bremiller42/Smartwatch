@@ -8,6 +8,9 @@
 #include "esp_event.h"
 #include "esp_wifi_types.h"
 
+extern const char *FW_VERSION;
+
+
 /* ---------------- UI globals ---------------- */
 extern lv_obj_t *clock_date_lbl;
 extern lv_obj_t *clock_time_lbl;

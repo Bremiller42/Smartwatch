@@ -377,6 +377,8 @@ static bool fetch_weather_by_latlon(float lat, float lon, weather_snapshot_t *ou
     char rx[HTTP_RX_MAX];
     int status = 0;
 
+    if (!out) return false;
+
     snprintf(url, sizeof(url),
              "https://api.openweathermap.org/data/2.5/weather?lat=%.5f&lon=%.5f&units=metric&appid=%s",
              (double)lat, (double)lon, s_api_key);
@@ -390,13 +392,16 @@ static bool fetch_weather_by_latlon(float lat, float lon, weather_snapshot_t *ou
     cJSON *root = cJSON_Parse(rx);
     if (!root) return false;
 
+    bool ok = false;
+
     cJSON *main = cJSON_GetObjectItemCaseSensitive(root, "main");
     cJSON *temp = main ? cJSON_GetObjectItemCaseSensitive(main, "temp") : NULL;
     cJSON *hum  = main ? cJSON_GetObjectItemCaseSensitive(main, "humidity") : NULL;
 
     cJSON *weather = cJSON_GetObjectItemCaseSensitive(root, "weather");
     cJSON *w0 = (cJSON_IsArray(weather) ? cJSON_GetArrayItem(weather, 0) : NULL);
-    cJSON *id = w0 ? cJSON_GetObjectItemCaseSensitive(w0, "id") : NULL;
+    cJSON *id   = w0 ? cJSON_GetObjectItemCaseSensitive(w0, "id")   : NULL;
+    cJSON *icon = w0 ? cJSON_GetObjectItemCaseSensitive(w0, "icon") : NULL;
 
     cJSON *wind = cJSON_GetObjectItemCaseSensitive(root, "wind");
     cJSON *ws   = wind ? cJSON_GetObjectItemCaseSensitive(wind, "speed") : NULL; // m/s
@@ -406,28 +411,43 @@ static bool fetch_weather_by_latlon(float lat, float lon, weather_snapshot_t *ou
     cJSON *sunr = sys ? cJSON_GetObjectItemCaseSensitive(sys, "sunrise") : NULL;
     cJSON *suns = sys ? cJSON_GetObjectItemCaseSensitive(sys, "sunset")  : NULL;
 
-    bool ok = cJSON_IsNumber(temp) && cJSON_IsNumber(hum) && cJSON_IsNumber(id);
+    ok = cJSON_IsNumber(temp) && cJSON_IsNumber(hum) && cJSON_IsNumber(id);
 
     if (ok) {
         memset(out, 0, sizeof(*out));
         out->valid = true;
 
-        out->temp_c_x10     = (int)(temp->valuedouble * 10.0);
-        out->humidity_pct   = hum->valueint;
-        out->condition_id   = id->valueint;
-        out->updated_ms     = now_ms();
+        out->temp_c_x10   = (int)(temp->valuedouble * 10.0);
+        out->humidity_pct = hum->valueint;
+        out->condition_id = id->valueint;
+        out->updated_ms   = now_ms();
 
         if (cJSON_IsNumber(ws)) out->wind_mps_x10 = (int)(ws->valuedouble * 10.0);
         else out->wind_mps_x10 = 0;
 
-        bool is_day = true;
-        if (cJSON_IsNumber(dtj) && cJSON_IsNumber(sunr) && cJSON_IsNumber(suns)) {
-            int64_t dt  = (int64_t)dtj->valuedouble;
-            int64_t sr  = (int64_t)sunr->valuedouble;
-            int64_t ss  = (int64_t)suns->valuedouble;
-            is_day = (dt >= sr && dt < ss);
+        // icon code (preferred)
+        out->icon_code[0] = '\0';
+
+        if (cJSON_IsString(icon) && icon->valuestring && strlen(icon->valuestring) >= 3) {
+            // "01d" / "10n"
+            snprintf(out->icon_code, sizeof(out->icon_code), "%.3s", icon->valuestring);
+
+            // Day/night from icon code
+            char dn = out->icon_code[2];
+            if (dn == 'd') out->is_day = true;
+            else if (dn == 'n') out->is_day = false;
+            else out->is_day = true; // safe default
+        } else {
+            // Fallback: day/night from dt/sunrise/sunset
+            bool is_day = true;
+            if (cJSON_IsNumber(dtj) && cJSON_IsNumber(sunr) && cJSON_IsNumber(suns)) {
+                int64_t dt = (int64_t)dtj->valuedouble;
+                int64_t sr = (int64_t)sunr->valuedouble;
+                int64_t ss = (int64_t)suns->valuedouble;
+                is_day = (dt >= sr && dt < ss);
+            }
+            out->is_day = is_day;
         }
-        out->is_day = is_day;
     }
 
     cJSON_Delete(root);
@@ -488,10 +508,12 @@ static void weather_task(void *arg)
         s_last_fetch_ms = t;
         s_last = snap;
 
-        ESP_LOGI(TAG, "Updated: %d.%dC, hum=%d%%, id=%d wind=%d.%dm/s day=%d quota=%u/%u",
+        ESP_LOGI(TAG, "Updated: %d.%dC, hum=%d%%, id=%d icon=%s wind=%d.%dm/s day=%d quota=%u/%u",
                  s_last.temp_c_x10 / 10, abs(s_last.temp_c_x10 % 10),
                  s_last.humidity_pct, s_last.condition_id,
-                 s_last.wind_mps_x10 / 10, abs(s_last.wind_mps_x10 % 10),
+                 s_last.icon_code,
+                 s_last.wind_mps_x10 / 10, 
+                 abs(s_last.wind_mps_x10 % 10),
                  (int)s_last.is_day,
                  (unsigned)s_quota_count, (unsigned)WEATHER_REQ_LIMIT_DAY);
 

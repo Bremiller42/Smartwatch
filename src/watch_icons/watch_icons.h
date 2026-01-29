@@ -50,6 +50,7 @@
 #define icon_cloud_solid_42              cloud_solid_full_1_a8_42
 #define icon_cloud_regular_42            cloud_regular_full_1_a8_42
 
+#define icon_moon_solid_42           moon_solid_full_a8_42
 #define icon_moon_regular_42             moon_regular_full_a8_42
 #define icon_sun_regular_42              sun_regular_full_1_a8_42
 

@@ -12,7 +12,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
-
+#include "watch_globals.h"
 #include "watch_screen_timeout.h"
 #include "ui_priv.h"
 #include <stdio.h>
@@ -35,6 +35,7 @@ static lv_obj_t   *s_lbl_chip   = NULL;
 static lv_obj_t   *s_lbl_id     = NULL;
 static lv_obj_t   *s_lbl_uptime = NULL;
 static lv_obj_t   *s_lbl_flash  = NULL;
+static lv_obj_t   *s_lbl_fw     = NULL;
 
 static lv_obj_t   *s_lbl_heap_txt   = NULL;
 static lv_obj_t   *s_lbl_psram_txt  = NULL;
@@ -47,7 +48,6 @@ static lv_obj_t   *s_lbl_drain  = NULL;
 static lv_timer_t *s_timer = NULL;
 
 /* Screen-timeout override token (matches log screen pattern) */
-static int s_about_to_token = -1;
 static void device_info_enter_always_on(void);
 static void device_info_exit_always_on(void);
 static void on_screen_delete(lv_event_t *e);
@@ -68,23 +68,19 @@ static void fmt_uptime(char *out, size_t out_sz, int64_t ms)
     } else {
         snprintf(out, out_sz, "%" PRId64 "m %" PRId64 "s", min, sec);
     }
-}
+}    
 static void device_info_enter_always_on(void)
 {
-    if (s_about_to_token < 0) {
-        s_about_to_token = screen_timeout_push_override_ms(0); // never timeout while on this screen
-        screen_timeout_mark_activity();
-    }
+    screen_keep_awake_acquire();
+    screen_timeout_mark_activity();
 }
 
 static void device_info_exit_always_on(void)
 {
-    if (s_about_to_token >= 0) {
-        screen_timeout_pop_override(s_about_to_token);
-        s_about_to_token = -1;
-        screen_timeout_mark_activity();
-    }
+    screen_keep_awake_release();
+    screen_timeout_mark_activity();
 }
+
 
 static const char *chip_model_str(esp_chip_model_t m)
 {
@@ -226,6 +222,7 @@ static void on_screen_delete(lv_event_t *e)
 
     s_lbl_batt = NULL;
     s_lbl_drain = NULL;
+    s_lbl_fw = NULL;
 
     if (s_timer) lv_timer_pause(s_timer);
 }
@@ -242,6 +239,10 @@ static void refresh_cb(lv_timer_t *t)
     esp_chip_info(&ci);
 
     char buf[256];
+
+    if (s_lbl_fw) {
+        lv_label_set_text(s_lbl_fw, FW_VERSION ? FW_VERSION : "unknown");
+    }
 
     snprintf(buf, sizeof(buf), "%s, %d core(s), rev %d",
              chip_model_str(ci.model), ci.cores, ci.revision);
@@ -369,7 +370,8 @@ lv_obj_t *ui_build_device_info_screen(void)
 
     lv_obj_set_flex_flow(s_rows_cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_rows_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-
+    
+    make_row(s_rows_cont, "Firmware", &s_lbl_fw);
     make_row(s_rows_cont, "Chip", &s_lbl_chip);
     make_row(s_rows_cont, "Chip ID (MAC)", &s_lbl_id);
     make_row(s_rows_cont, "Uptime", &s_lbl_uptime);

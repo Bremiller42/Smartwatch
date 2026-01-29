@@ -262,6 +262,7 @@ void setup(void)
 
     // Debug touch interrupt monitoring task
     // xTaskCreate(touch_int_debug_task, "touch_int_dbg", 2048, NULL, 1, NULL);
+    backlight_set_user_pct(60);   // TEMP: force visible backlight
 
     watch_audio_beep(880,  60);
     watch_audio_beep(1320, 50);

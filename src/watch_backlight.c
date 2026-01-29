@@ -3,7 +3,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
-
+#include "watch_globals.h" // g_brightness
 #include "esp_log.h"
 #include "display.h" // bsp_display_brightness_set()
 
@@ -46,6 +46,10 @@ void backlight_apply_now(void)
 void backlight_init(int persisted_user_pct)
 {
     s_user_pct  = clamp_pct(persisted_user_pct);
+    if (s_user_pct < 10) {
+        s_user_pct = 10; // minimum user brightness
+        g_brightness = s_user_pct; // update global
+    }
     s_cap_pct   = 100;
     s_screen_on = true;
 

@@ -4,23 +4,16 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
-#define STO_MAX_STACK 8
 static const char *TAG = "SCR_TO";
-
-typedef struct {
-    uint32_t ms;
-    int      token;
-} sto_entry_t;
-
-static sto_entry_t s_stack[STO_MAX_STACK];
-static int s_stack_len = 0;
-static int s_next_token = 1;
 
 /* Default timeout (ms) from Settings */
 static uint32_t s_default_ms = 15000;
 
 /* Persistent Always-On from Settings */
 static bool s_always_on = false;
+
+/* Simple temporary keep-awake override (refcounted) */
+static uint32_t s_keep_awake_refs = 0;
 
 /* Deadline bookkeeping */
 static uint32_t s_deadline_ms = 0;
@@ -31,10 +24,9 @@ static inline uint32_t now_ms_local(void)
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-static uint32_t effective_ms_raw(void)
+static bool keep_awake_active(void)
 {
-    if (s_stack_len > 0) return s_stack[s_stack_len - 1].ms;
-    return s_default_ms;
+    return (s_keep_awake_refs > 0);
 }
 
 uint32_t screen_timeout_get_default_ms(void)
@@ -58,30 +50,26 @@ void screen_timeout_set_always_on(bool on)
 {
     if (s_always_on == on) return;
     s_always_on = on;
-    // Treat as activity so we don't instantly blank or behave oddly.
     screen_timeout_mark_activity();
     ESP_LOGI(TAG, "Always-On (persistent) -> %d", (int)on);
 }
 
+/* Effective timeout:
+ * - persistent always-on => never timeout
+ * - temporary keep-awake => never timeout
+ * - else => default timeout
+ */
 uint32_t screen_timeout_get_effective_ms(void)
 {
-    // Persistent Always-On overrides everything (Settings policy)
     if (s_always_on) return 0;
-
-    // Otherwise: top override if present, else default
-    return effective_ms_raw();
-}
-
-bool screen_timeout_is_overridden(void)
-{
-    return (s_stack_len > 0);
+    if (keep_awake_active()) return 0;
+    return s_default_ms;
 }
 
 static void recompute_deadline(uint32_t now_ms)
 {
     uint32_t ms = screen_timeout_get_effective_ms();
 
-    // ms == 0 means "never timeout"
     if (ms == 0) {
         s_deadline_valid = false;
         s_deadline_ms = 0;
@@ -97,51 +85,11 @@ void screen_timeout_init(uint32_t default_ms)
     if (default_ms < 1000) default_ms = 1000;
     s_default_ms = default_ms;
 
-    s_stack_len = 0;
-    s_next_token = 1;
+    s_keep_awake_refs = 0;
 
     s_deadline_valid = false;
     s_deadline_ms = 0;
 
-    screen_timeout_mark_activity();
-}
-
-int screen_timeout_push_override_ms(uint32_t ms)
-{
-    if (s_stack_len >= STO_MAX_STACK) {
-        ESP_LOGW(TAG, "override stack full");
-        return -1;
-    }
-
-    // ms==0 is allowed ("never"). Otherwise enforce minimum.
-    if (ms != 0 && ms < 1000) ms = 1000;
-
-    int token = s_next_token++;
-    s_stack[s_stack_len++] = (sto_entry_t){ .ms = ms, .token = token };
-
-    // Override changes policy immediately
-    screen_timeout_mark_activity();
-    return token;
-}
-
-void screen_timeout_pop_override(int token)
-{
-    if (s_stack_len <= 0) return;
-
-    // Only pop top token (safe nesting discipline)
-    if (s_stack[s_stack_len - 1].token != token) {
-        ESP_LOGW(TAG, "pop token mismatch (top=%d got=%d)",
-                 s_stack[s_stack_len - 1].token, token);
-        return;
-    }
-
-    s_stack_len--;
-    screen_timeout_mark_activity();
-}
-
-void screen_timeout_clear_overrides(void)
-{
-    s_stack_len = 0;
     screen_timeout_mark_activity();
 }
 
@@ -152,11 +100,75 @@ void screen_timeout_mark_activity(void)
 
 bool screen_timeout_expired(uint32_t now_ms)
 {
-    if (!s_deadline_valid) return false; // always-on
+    if (!s_deadline_valid) return false;
     return (now_ms >= s_deadline_ms);
 }
 
 uint32_t screen_timeout_deadline_ms(void)
 {
     return s_deadline_valid ? s_deadline_ms : 0;
+}
+
+/* -------- NEW: keep-awake control -------- */
+
+void screen_keep_awake_set(bool on)
+{
+    if (on) {
+        if (s_keep_awake_refs == 0) {
+            s_keep_awake_refs = 1;
+            screen_timeout_mark_activity();
+            ESP_LOGI(TAG, "KeepAwake -> ON (refs=%u)", (unsigned)s_keep_awake_refs);
+        }
+    } else {
+        if (s_keep_awake_refs != 0) {
+            s_keep_awake_refs = 0;
+            screen_timeout_mark_activity();
+            ESP_LOGI(TAG, "KeepAwake -> OFF");
+        }
+    }
+}
+
+bool screen_keep_awake_get(void)
+{
+    return keep_awake_active();
+}
+
+bool screen_keep_awake_toggle(void)
+{
+    bool now_on = !keep_awake_active();
+    screen_keep_awake_set(now_on);
+    return now_on;
+}
+
+void screen_keep_awake_acquire(void)
+{
+    if (s_keep_awake_refs == 0) {
+        s_keep_awake_refs = 1;
+        screen_timeout_mark_activity();
+        ESP_LOGI(TAG, "KeepAwake acquire (refs=%u)", (unsigned)s_keep_awake_refs);
+        return;
+    }
+
+    if (s_keep_awake_refs < 0xFFFFFFFFu) s_keep_awake_refs++;
+    // no need to mark activity; still never-timeout
+    ESP_LOGI(TAG, "KeepAwake acquire (refs=%u)", (unsigned)s_keep_awake_refs);
+}
+
+void screen_keep_awake_release(void)
+{
+    if (s_keep_awake_refs == 0) return;
+
+    s_keep_awake_refs--;
+    ESP_LOGI(TAG, "KeepAwake release (refs=%u)", (unsigned)s_keep_awake_refs);
+
+    if (s_keep_awake_refs == 0) {
+        // when keep-awake ends, start deadline from "now"
+        screen_timeout_mark_activity();
+        ESP_LOGI(TAG, "KeepAwake -> OFF (refs=0)");
+    }
+}
+
+uint32_t screen_keep_awake_refcount(void)
+{
+    return s_keep_awake_refs;
 }

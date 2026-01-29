@@ -38,7 +38,6 @@ static lv_obj_t   *s_label          = NULL;   // label holding log text
 static lv_timer_t *s_timer          = NULL;
 static lv_obj_t   *s_btn_bottom     = NULL;
 static lv_obj_t   *s_btn_bottom_lbl = NULL;
-static int         s_log_to_token   = -1;
 
 /* ---------------- Autoscroll state ---------------- */
 static bool s_autoscroll     = true;   // follow tail by default
@@ -93,20 +92,16 @@ static inline bool log_char_ok(char *c_inout)
 
 static void log_screen_enter_always_on(void)
 {
-    if (s_log_to_token < 0) {
-        s_log_to_token = screen_timeout_push_override_ms(0); // never timeout while on this screen
-        screen_timeout_mark_activity();
-    }
+    screen_keep_awake_acquire();
+    screen_timeout_mark_activity();
 }
 
 static void log_screen_exit_always_on(void)
 {
-    if (s_log_to_token >= 0) {
-        screen_timeout_pop_override(s_log_to_token);
-        s_log_to_token = -1;
-        screen_timeout_mark_activity();
-    }
+    screen_keep_awake_release();
+    screen_timeout_mark_activity();
 }
+
 
 static void ring_reset(void)
 {
@@ -223,11 +218,11 @@ static void scroll_to_bottom_oneshot(lv_timer_t *t)
 
 /* ---------------- Events ---------------- */
 
-static void on_log_back(lv_event_t *e)
+static void on_back(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-    /* This triggers screen delete for current screen, which will clean up */
+    log_screen_exit_always_on();
     ui_show(UI_HOME);
 }
 
@@ -357,7 +352,7 @@ lv_obj_t *ui_build_log_screen(void)
     lv_obj_set_style_radius(back, 8, 0);
     lv_obj_set_style_bg_color(back, lv_color_hex(0x202020), 0);
     lv_obj_set_style_bg_opa(back, LV_OPA_60, 0);
-    lv_obj_add_event_cb(back, on_log_back, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(back, on_back, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *btxt = lv_label_create(back);
     lv_label_set_text(btxt, LV_SYMBOL_LEFT);

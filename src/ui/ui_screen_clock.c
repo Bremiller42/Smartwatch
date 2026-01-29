@@ -25,23 +25,47 @@ static void on_back_to_home(lv_event_t * e)
 {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) ui_show(UI_HOME);
 }
-static const void *wx_icon_for_condition(int cond_id, bool is_day)
+static const void *wx_icon_for_ow_icon(const char *icon_code)
 {
-    // OpenWeather condition buckets:
-    // 2xx thunder, 3xx drizzle, 5xx rain, 6xx snow, 7xx atmosphere, 800 clear, 80x clouds
-    if (cond_id >= 200 && cond_id <= 232) return &icon_cloud_bolt_solid_42;
-    if (cond_id >= 300 && cond_id <= 321) return &icon_cloud_rain_solid_42;          // drizzle -> rain icon
-    if (cond_id >= 500 && cond_id <= 531) return &icon_cloud_rain_solid_42;
-    if (cond_id >= 600 && cond_id <= 622) return &icon_snowflake_solid_42;
-    if (cond_id >= 700 && cond_id <= 781) return &icon_wind_solid_42;                // fog/dust -> wind-ish icon
-    if (cond_id == 800) {
-        return is_day ? (const void*)&icon_sun_solid_42 : (const void*)&icon_moon_regular_42;
-    }
-    if (cond_id >= 801 && cond_id <= 804) return &icon_cloud_solid_42;
+    // OpenWeather icon codes:
+    // 01 clear, 02 few clouds, 03 scattered, 04 broken
+    // 09 shower rain, 10 rain, 11 thunder, 13 snow, 50 mist
+    if (!icon_code || icon_code[0] == '\0') return &icon_cloud_regular_42;
 
-    // fallback
+    bool night = (strlen(icon_code) >= 3 && icon_code[2] == 'n');
+
+    // Match by the first two chars
+    if (icon_code[0] == '0' && icon_code[1] == '1') {
+        return night ? (const void*)&icon_moon_solid_42 : (const void*)&icon_sun_solid_42;
+    }
+    if (icon_code[0] == '0' && icon_code[1] == '2') {
+        // You don't currently have a dedicated partly-cloudy 42 icon;
+        // pick cloud vs sun/moon based on day/night.
+        return night ? (const void*)&icon_cloud_solid_42 : (const void*)&icon_cloud_solid_42;
+    }
+    if (icon_code[0] == '0' && (icon_code[1] == '3' || icon_code[1] == '4')) {
+        return &icon_cloud_solid_42;
+    }
+    if (icon_code[0] == '0' && icon_code[1] == '9') {
+        return &icon_cloud_rain_solid_42;
+    }
+    if (icon_code[0] == '1' && icon_code[1] == '0') {
+        return &icon_cloud_rain_solid_42;
+    }
+    if (icon_code[0] == '1' && icon_code[1] == '1') {
+        return &icon_cloud_bolt_solid_42;
+    }
+    if (icon_code[0] == '1' && icon_code[1] == '3') {
+        return &icon_snowflake_solid_42;
+    }
+    if (icon_code[0] == '5' && icon_code[1] == '0') {
+        // mist/fog: you chose "wind-ish"
+        return &icon_wind_solid_42;
+    }
+
     return &icon_cloud_regular_42;
 }
+
 
 static bool wx_is_windy_mph10(int wind_mps_x10)
 {
@@ -64,14 +88,14 @@ static void wx_refresh_async(void *arg)
 
     // Temp: show in F if configured
     int temp_x10 = s.temp_c_x10;
-    char unit = 'C';
+    const char *unit = "°C";
     if (weather_get_use_fahrenheit()) {
         temp_x10 = (s.temp_c_x10 * 9) / 5 + 320;
-        unit = 'F';
+        unit = "°F";
     }
-
     char tbuf[24];
-    snprintf(tbuf, sizeof(tbuf), "%d.%d%c", temp_x10 / 10, abs(temp_x10 % 10), unit);
+
+    snprintf(tbuf, sizeof(tbuf), "%d.%d%s", temp_x10/10, abs(temp_x10%10), unit);
 
     char hbuf[24];
     snprintf(hbuf, sizeof(hbuf), "%d%%", s.humidity_pct);
@@ -81,7 +105,15 @@ static void wx_refresh_async(void *arg)
 
     // Main icon
     if (wx_icon_main) {
-        const void *src = wx_icon_for_condition(s.condition_id, s.is_day);
+        const void *src = NULL;
+
+        if (s.icon_code[0] != '\0') {
+            src = wx_icon_for_ow_icon(s.icon_code);
+        } else {
+            // Fallback: derive from is_day
+            src = s.is_day ? (const void*)&icon_sun_solid_42 : (const void*)&icon_moon_solid_42;
+        }
+
         lv_img_set_src(wx_icon_main, src);
     }
 
@@ -110,6 +142,7 @@ static void on_hr_read_now(lv_event_t *e)
 static void ui_hr_widget_refresh_async(void *arg)
 {
     (void)arg;
+    if (!hr_status_lbl || !hr_bpm_lbl || !hr_prog_arc) return;
 
     hr_ui_status_t st;
     hr_get_ui_status(&st);
@@ -201,32 +234,36 @@ lv_obj_t *ui_build_clock_screen(void)
     lv_obj_set_style_text_align(phone_batt_lbl, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_align_to(phone_batt_lbl, scr, LV_ALIGN_LEFT_MID, -20, -55);
 
+    // --- Big BPM ---
+    hr_bpm_lbl = lv_label_create(scr);
+    lv_label_set_text(hr_bpm_lbl, "--");
+    lv_obj_set_style_text_color(hr_bpm_lbl, UI_COLOR(RED), 0);
+    lv_obj_set_style_text_font(hr_bpm_lbl, &lv_font_montserrat_26, 0);
+    lv_obj_align(hr_bpm_lbl, LV_ALIGN_RIGHT_MID, -18, 10);
+
     // --- Heart rate status text ---
     hr_status_lbl = lv_label_create(scr);
     lv_label_set_text(hr_status_lbl, "HR: Idle");
     lv_obj_set_style_text_color(hr_status_lbl, UI_COLOR(RED), 0);
     lv_obj_set_style_text_font(hr_status_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_opa(hr_status_lbl, LV_OPA_80, 0);
-    lv_obj_align(hr_status_lbl, LV_ALIGN_RIGHT_MID, -18, -30);
-
-    // --- Big BPM ---
-    hr_bpm_lbl = lv_label_create(scr);
-    lv_label_set_text(hr_bpm_lbl, "--");
-    lv_obj_set_style_text_color(hr_bpm_lbl, UI_COLOR(RED), 0);
-    lv_obj_set_style_text_font(hr_bpm_lbl, &lv_font_montserrat_26, 0);   // or smaller if you want
-    lv_obj_align(hr_bpm_lbl, LV_ALIGN_RIGHT_MID, -18, 10);
+    lv_obj_set_style_text_align(hr_status_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align_to(hr_status_lbl, hr_bpm_lbl, LV_ALIGN_OUT_TOP_MID, -80, -10);
 
     // --- Progress arc (hidden unless measuring) ---
+    // Create AFTER hr_bpm_lbl exists, then center it on that label.
     hr_prog_arc = lv_arc_create(scr);
-    lv_obj_set_size(hr_prog_arc, 52, 52);
+    lv_obj_set_size(hr_prog_arc, 40, 40);
     lv_arc_set_rotation(hr_prog_arc, 270);
     lv_arc_set_bg_angles(hr_prog_arc, 0, 360);
     lv_arc_set_range(hr_prog_arc, 0, 100);
     lv_arc_set_value(hr_prog_arc, 0);
     lv_obj_set_style_arc_width(hr_prog_arc, 6, LV_PART_MAIN);
     lv_obj_set_style_arc_width(hr_prog_arc, 6, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(hr_prog_arc, UI_COLOR(RED), 1);
-    lv_obj_align(hr_prog_arc, LV_ALIGN_RIGHT_MID, -10, -5);
+    lv_obj_set_style_arc_color(hr_prog_arc, UI_COLOR(RED), LV_PART_INDICATOR);
+    // ✅ Center arc over BPM label (this is what you wanted)
+    lv_obj_align_to(hr_prog_arc, hr_bpm_lbl, LV_ALIGN_CENTER, 0, 0);
+
     lv_obj_add_flag(hr_prog_arc, LV_OBJ_FLAG_HIDDEN);
 
 
@@ -240,7 +277,7 @@ lv_obj_t *ui_build_clock_screen(void)
     lv_obj_clear_flag(hr_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(hr_btn, on_hr_read_now, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_align_to(hr_btn, hr_prog_arc, LV_ALIGN_OUT_RIGHT_MID, -90, 15);
+    lv_obj_align_to(hr_btn, hr_bpm_lbl, LV_ALIGN_LEFT_MID, -75, 0);
 
     hr_btn_icon = lv_img_create(hr_btn);
     lv_img_set_src(hr_btn_icon, &heart_pulse_solid_full_a8_32);
@@ -260,17 +297,21 @@ lv_obj_t *ui_build_clock_screen(void)
     lv_label_set_text(lv_label_create(menu), LV_SYMBOL_HOME);
     lv_obj_center(lv_obj_get_child(menu, 0));
 
-        // ---- Weather block (top-right) ----
     // ---- Weather block (anchored under HR button) ----
     wx_icon_main = lv_img_create(scr);
     lv_img_set_src(wx_icon_main, &icon_cloud_regular_42);
+    lv_obj_set_style_img_recolor(wx_icon_main, UI_COLOR(WHITE), 0);
+    lv_obj_set_style_img_recolor_opa(wx_icon_main, LV_OPA_COVER, 0);
 
-    // Place weather icon under the HR button, right-aligned with it.
-    // Tweak x/y to taste.
-    lv_obj_align_to(wx_icon_main, hr_btn, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
+    // ✅ anchor main icon under HR button
+    lv_obj_align_to(wx_icon_main, hr_btn, LV_ALIGN_OUT_BOTTOM_MID, 70, 10);
 
     wx_icon_wind = lv_img_create(scr);
     lv_img_set_src(wx_icon_wind, &icon_wind_solid_42);
+    lv_obj_set_style_img_recolor(wx_icon_wind, UI_COLOR(THEME), 0);
+    lv_obj_set_style_img_recolor_opa(wx_icon_wind, LV_OPA_COVER, 0);
+
+    // ✅ wind sits to the LEFT of main icon
     lv_obj_align_to(wx_icon_wind, wx_icon_main, LV_ALIGN_OUT_LEFT_MID, -8, 0);
     lv_obj_add_flag(wx_icon_wind, LV_OBJ_FLAG_HIDDEN);
 
@@ -280,7 +321,7 @@ lv_obj_t *ui_build_clock_screen(void)
     lv_label_set_text(wx_temp_lbl, "--");
 
     // Temp just under the main weather icon
-    lv_obj_align_to(wx_temp_lbl, wx_icon_main, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
+    lv_obj_align_to(wx_temp_lbl, wx_icon_main, LV_ALIGN_OUT_BOTTOM_MID, -35, 2);
 
     wx_hum_lbl = lv_label_create(scr);
     lv_obj_set_style_text_font(wx_hum_lbl, &lv_font_montserrat_14, 0);

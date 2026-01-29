@@ -38,3 +38,13 @@ void screen_timeout_mark_activity(void);
 // Tick/Query for your sleep/power manager
 bool     screen_timeout_expired(uint32_t now_ms);   // now_ms = esp_timer_get_time()/1000, etc
 uint32_t screen_timeout_deadline_ms(void);          // for debugging/UI
+
+/* NEW: simple global override API */
+void     screen_keep_awake_set(bool on);
+bool     screen_keep_awake_get(void);
+bool     screen_keep_awake_toggle(void);
+
+/* NEW: safe multi-caller hold/release */
+void     screen_keep_awake_acquire(void);
+void     screen_keep_awake_release(void);
+uint32_t screen_keep_awake_refcount(void);
