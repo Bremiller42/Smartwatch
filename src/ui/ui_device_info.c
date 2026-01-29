@@ -1,15 +1,5 @@
 // FILE: src/ui/ui_screen_device_info.c
 // Device Info / About screen (LVGL8)
-//
-// Shows:
-// - Chip model/cores/rev
-// - "Chip ID" (base MAC shown as hex)
-// - Uptime
-// - Flash size
-// - Heap/PSRAM free + largest block
-// - Battery %, voltage, drain rates, ETA
-//
-// Style matches your log screen (black bg, theme text, simple back button)
 
 #include "lvgl.h"
 #include "ui_priv.h"
@@ -21,14 +11,15 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_log.h"
 #include "esp_mac.h"
 
+#include "watch_screen_timeout.h"
+#include "ui_priv.h"
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
 
-/* Battery / drain globals (defined in watch_fuel.c in your snippet) */
+/* Battery / drain globals */
 extern int   g_watch_batt_pct;
 extern float g_watch_batt_v;
 extern float g_batt_drain_pct_per_hr;
@@ -44,16 +35,22 @@ static lv_obj_t   *s_lbl_chip   = NULL;
 static lv_obj_t   *s_lbl_id     = NULL;
 static lv_obj_t   *s_lbl_uptime = NULL;
 static lv_obj_t   *s_lbl_flash  = NULL;
+
 static lv_obj_t   *s_lbl_heap_txt   = NULL;
 static lv_obj_t   *s_lbl_psram_txt  = NULL;
-
-static lv_obj_t   *s_bar_heap  = NULL;
-static lv_obj_t   *s_bar_psram = NULL;
+static lv_obj_t   *s_bar_heap       = NULL;
+static lv_obj_t   *s_bar_psram      = NULL;
 
 static lv_obj_t   *s_lbl_batt   = NULL;
 static lv_obj_t   *s_lbl_drain  = NULL;
 
 static lv_timer_t *s_timer = NULL;
+
+/* Screen-timeout override token (matches log screen pattern) */
+static int s_about_to_token = -1;
+static void device_info_enter_always_on(void);
+static void device_info_exit_always_on(void);
+static void on_screen_delete(lv_event_t *e);
 
 /* ---------------- Helpers ---------------- */
 
@@ -72,6 +69,22 @@ static void fmt_uptime(char *out, size_t out_sz, int64_t ms)
         snprintf(out, out_sz, "%" PRId64 "m %" PRId64 "s", min, sec);
     }
 }
+static void device_info_enter_always_on(void)
+{
+    if (s_about_to_token < 0) {
+        s_about_to_token = screen_timeout_push_override_ms(0); // never timeout while on this screen
+        screen_timeout_mark_activity();
+    }
+}
+
+static void device_info_exit_always_on(void)
+{
+    if (s_about_to_token >= 0) {
+        screen_timeout_pop_override(s_about_to_token);
+        s_about_to_token = -1;
+        screen_timeout_mark_activity();
+    }
+}
 
 static const char *chip_model_str(esp_chip_model_t m)
 {
@@ -87,58 +100,47 @@ static const char *chip_model_str(esp_chip_model_t m)
     }
 }
 
-/* Create a "row card": title + value label */
-/* Create a compact "row card": title + value label */
+/* Compact text row */
 static lv_obj_t *make_row(lv_obj_t *parent, const char *title, lv_obj_t **out_value_label)
 {
     lv_obj_t *card = lv_obj_create(parent);
     lv_obj_set_width(card, lv_pct(100));
 
-    // Visual style (same vibe, tighter)
     lv_obj_set_style_bg_color(card, lv_color_hex(0x101010), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_70, 0);
     lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(0x303030), 0);
     lv_obj_set_style_radius(card, 12, 0);
 
-    // Tighter padding
     lv_obj_set_style_pad_left(card, 10, 0);
     lv_obj_set_style_pad_right(card, 10, 0);
     lv_obj_set_style_pad_top(card, 6, 0);
     lv_obj_set_style_pad_bottom(card, 6, 0);
-
-    // Reduce spacing between title/value
     lv_obj_set_style_pad_row(card, 2, 0);
 
-    // Compact height (acts like a "min-height" for flex items)
     lv_obj_set_height(card, LV_SIZE_CONTENT);
-    lv_obj_set_style_min_height(card, 44, 0);   // tweak: try 40..52 depending on your font
+    lv_obj_set_style_min_height(card, 44, 0);
 
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    // Title
     lv_obj_t *t = lv_label_create(card);
     lv_label_set_text(t, title);
     lv_obj_set_style_text_color(t, lv_color_hex(0x808080), 0);
     lv_obj_set_style_text_font(t, LV_FONT_DEFAULT, 0);
-    lv_obj_set_style_pad_top(t, 0, 0);
-    lv_obj_set_style_pad_bottom(t, 0, 0);
 
-    // Value
     lv_obj_t *v = lv_label_create(card);
     lv_label_set_text(v, "--");
     lv_label_set_long_mode(v, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(v, lv_pct(100));
     lv_obj_set_style_text_color(v, UI_COLOR(THEME), 0);
     lv_obj_set_style_text_font(v, LV_FONT_DEFAULT, 0);
-    lv_obj_set_style_pad_top(v, 0, 0);
-    lv_obj_set_style_pad_bottom(v, 0, 0);
 
     if (out_value_label) *out_value_label = v;
     return card;
 }
 
+/* Bar row: title + bar + text */
 static lv_obj_t *make_bar_row(lv_obj_t *parent, const char *title,
                               lv_obj_t **out_bar, lv_obj_t **out_text_label)
 {
@@ -158,7 +160,7 @@ static lv_obj_t *make_bar_row(lv_obj_t *parent, const char *title,
     lv_obj_set_style_pad_row(card, 4, 0);
 
     lv_obj_set_height(card, LV_SIZE_CONTENT);
-    lv_obj_set_style_min_height(card, 52, 0); // slightly taller than text row (bar needs room)
+    lv_obj_set_style_min_height(card, 52, 0);
 
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
@@ -174,7 +176,6 @@ static lv_obj_t *make_bar_row(lv_obj_t *parent, const char *title,
     lv_bar_set_range(bar, 0, 100);
     lv_bar_set_value(bar, 0, LV_ANIM_OFF);
 
-    // style the bar to match your dark theme
     lv_obj_set_style_radius(bar, 6, LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x1A1A1A), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
@@ -198,12 +199,17 @@ static lv_obj_t *make_bar_row(lv_obj_t *parent, const char *title,
 static void on_back(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    device_info_exit_always_on();
     ui_show(UI_HOME);
 }
+
 
 static void on_screen_delete(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_DELETE) return;
+
+    device_info_exit_always_on();
 
     s_title = NULL;
     s_rows_cont = NULL;
@@ -212,6 +218,7 @@ static void on_screen_delete(lv_event_t *e)
     s_lbl_id = NULL;
     s_lbl_uptime = NULL;
     s_lbl_flash = NULL;
+
     s_lbl_heap_txt = NULL;
     s_lbl_psram_txt = NULL;
     s_bar_heap = NULL;
@@ -223,15 +230,14 @@ static void on_screen_delete(lv_event_t *e)
     if (s_timer) lv_timer_pause(s_timer);
 }
 
+
 /* ---------------- Refresh ---------------- */
 
 static void refresh_cb(lv_timer_t *t)
 {
     (void)t;
-
     if (!s_lbl_chip) return;
 
-    /* Chip info */
     esp_chip_info_t ci;
     esp_chip_info(&ci);
 
@@ -241,7 +247,6 @@ static void refresh_cb(lv_timer_t *t)
              chip_model_str(ci.model), ci.cores, ci.revision);
     lv_label_set_text(s_lbl_chip, buf);
 
-    /* Chip "ID" (base MAC) */
     uint8_t mac[6] = {0};
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
         snprintf(buf, sizeof(buf), "%02X%02X%02X%02X%02X%02X",
@@ -251,23 +256,18 @@ static void refresh_cb(lv_timer_t *t)
     }
     lv_label_set_text(s_lbl_id, buf);
 
-    /* Uptime */
     int64_t now_ms = esp_timer_get_time() / 1000;
     char up[64];
     fmt_uptime(up, sizeof(up), now_ms);
     lv_label_set_text(s_lbl_uptime, up);
 
-    /* Flash */
     uint32_t flash_bytes = 0;
     (void)esp_flash_get_size(NULL, &flash_bytes);
-    if (flash_bytes > 0) {
-        snprintf(buf, sizeof(buf), "%.1f MB", (double)flash_bytes / (1024.0 * 1024.0));
-    } else {
-        snprintf(buf, sizeof(buf), "unknown");
-    }
+    if (flash_bytes > 0) snprintf(buf, sizeof(buf), "%.1f MB", (double)flash_bytes / (1024.0 * 1024.0));
+    else                 snprintf(buf, sizeof(buf), "unknown");
     lv_label_set_text(s_lbl_flash, buf);
 
-       /* Heap (Internal) bar */
+    /* Internal heap */
     size_t int_total  = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
     size_t int_free   = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     size_t int_used   = (int_total >= int_free) ? (int_total - int_free) : 0;
@@ -280,14 +280,13 @@ static void refresh_cb(lv_timer_t *t)
     }
 
     if (s_bar_heap) lv_bar_set_value(s_bar_heap, int_pct, LV_ANIM_OFF);
-
     if (s_lbl_heap_txt) {
         snprintf(buf, sizeof(buf), "%u KB / %u KB (%d%% used)",
                  (unsigned)(int_used / 1024), (unsigned)(int_total / 1024), int_pct);
         lv_label_set_text(s_lbl_heap_txt, buf);
     }
 
-    /* PSRAM bar */
+    /* PSRAM */
     size_t ps_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     size_t ps_free  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t ps_used  = (ps_total >= ps_free) ? (ps_total - ps_free) : 0;
@@ -301,7 +300,6 @@ static void refresh_cb(lv_timer_t *t)
         if (ps_pct > 100) ps_pct = 100;
 
         if (s_bar_psram) lv_bar_set_value(s_bar_psram, ps_pct, LV_ANIM_OFF);
-
         if (s_lbl_psram_txt) {
             snprintf(buf, sizeof(buf), "%u KB / %u KB (%d%% used)",
                      (unsigned)(ps_used / 1024), (unsigned)(ps_total / 1024), ps_pct);
@@ -309,8 +307,6 @@ static void refresh_cb(lv_timer_t *t)
         }
     }
 
-
-    /* Battery */
     if (g_watch_batt_pct < 0 || g_watch_batt_v < 0.0f) {
         lv_label_set_text(s_lbl_batt, "--");
     } else {
@@ -318,9 +314,6 @@ static void refresh_cb(lv_timer_t *t)
         lv_label_set_text(s_lbl_batt, buf);
     }
 
-    /* Drain / ETA */
-    // Convention: + means charging (SOC rising), - means draining
-    // Show ETA only when draining and valid
     if (g_batt_eta_min > 0) {
         int hr = g_batt_eta_min / 60;
         int mn = g_batt_eta_min % 60;
@@ -344,7 +337,7 @@ lv_obj_t *ui_build_device_info_screen(void)
 
     lv_obj_add_event_cb(scr, on_screen_delete, LV_EVENT_DELETE, NULL);
 
-    /* Back button (matches your style) */
+    /* back button */
     lv_obj_t *back = lv_btn_create(scr);
     lv_obj_set_size(back, 25, 25);
     lv_obj_align(back, LV_ALIGN_TOP_LEFT, 8, 8);
@@ -358,14 +351,14 @@ lv_obj_t *ui_build_device_info_screen(void)
     lv_obj_set_style_text_color(btxt, UI_COLOR(RED), 0);
     lv_obj_center(btxt);
 
-    /* Title */
+    /* title */
     s_title = lv_label_create(scr);
     lv_label_set_text(s_title, "Device Info");
     lv_obj_set_style_text_color(s_title, UI_COLOR(THEME), 0);
     lv_obj_set_style_text_font(s_title, LV_FONT_DEFAULT, 0);
     lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 10);
 
-    /* Rows container (simple vertical flex) */
+    /* rows container */
     s_rows_cont = lv_obj_create(scr);
     lv_obj_set_size(s_rows_cont, lv_pct(96), lv_pct(86));
     lv_obj_align(s_rows_cont, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -377,27 +370,27 @@ lv_obj_t *ui_build_device_info_screen(void)
     lv_obj_set_flex_flow(s_rows_cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_rows_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    /* Cards */
     make_row(s_rows_cont, "Chip", &s_lbl_chip);
     make_row(s_rows_cont, "Chip ID (MAC)", &s_lbl_id);
     make_row(s_rows_cont, "Uptime", &s_lbl_uptime);
     make_row(s_rows_cont, "Flash", &s_lbl_flash);
+
     make_bar_row(s_rows_cont, "Internal Heap", &s_bar_heap, &s_lbl_heap_txt);
     make_bar_row(s_rows_cont, "PSRAM", &s_bar_psram, &s_lbl_psram_txt);
 
     make_row(s_rows_cont, "Battery", &s_lbl_batt);
     make_row(s_rows_cont, "Drain / ETA", &s_lbl_drain);
 
-    /* Timer */
-    if (!s_timer) {
-        s_timer = lv_timer_create(refresh_cb, DEV_REFRESH_MS, NULL);
-    } else {
-        lv_timer_set_period(s_timer, DEV_REFRESH_MS);
-    }
+    /* timer */
+    if (!s_timer) s_timer = lv_timer_create(refresh_cb, DEV_REFRESH_MS, NULL);
+    else          lv_timer_set_period(s_timer, DEV_REFRESH_MS);
     lv_timer_resume(s_timer);
 
-    /* Initial populate */
     refresh_cb(NULL);
+
+    /* EXACTLY like log screen: push override at end of build */
+    device_info_enter_always_on();
+
 
     return scr;
 }

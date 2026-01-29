@@ -50,7 +50,7 @@ void open_wifi_picker_modal(lv_obj_t *parent);
 void close_wifi_picker_modal(void);
 void open_wifi_password_modal(lv_obj_t *parent, const char *ssid);
 void close_wifi_password_modal(void);
-
+void always_on(void);
 
 /* ---------------- Tiles ---------------- */
 lv_obj_t *tile_create_base(

@@ -580,17 +580,22 @@ void ble_request_sleep_params(void)
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
     struct ble_gap_upd_params p = {0};
-    // Lower power while screen off:
+
     // interval units = 1.25ms
-    p.itvl_min = 96;   // 120ms
-    p.itvl_max = 128;  // 160ms
-    p.latency  = 5;
+    // 640 = 800ms
+    p.itvl_min = 640;   // 800ms
+    p.itvl_max = 960;   // 1200ms
+
+    // allow skipping many events
+    p.latency  = 30;    // effective wake can be ~ (interval * (latency+1))
+
     // supervision_timeout units = 10ms
-    p.supervision_timeout = 500; // 5s
+    p.supervision_timeout = 3000; // 30s
 
     int rc = ble_gap_update_params(s_conn_handle, &p);
-    ESP_LOGI(BLE_TAG, "BLE params -> SLEEP rc=%d", rc);
+    ESP_LOGI(BLE_TAG, "BLE params -> SLEEP rc=%d (800-1200ms, lat=30, to=30s)", rc);
 }
+
 
 void ble_request_awake_params(void)
 {
@@ -657,8 +662,10 @@ static void ble_advertise(void)
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
     // intervals units = 0.625ms
-    adv_params.itvl_min = 0x0030; // 30ms
-    adv_params.itvl_max = 0x0060; // 60ms
+    // 1600 = 1000ms, 3200 = 2000ms
+    adv_params.itvl_min = 1600;   // 1.0s
+    adv_params.itvl_max = 3200;   // 2.0s
+
 
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, gap_event_cb, NULL);

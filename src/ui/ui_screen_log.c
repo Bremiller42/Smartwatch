@@ -9,6 +9,7 @@
 // 5) UI-side ring buffer (no expensive widget trimming)
 // 6) robust autoscroll: follows only if user is at bottom
 // 7) "Bottom" button appears when user scrolls up
+// 8) clean teardown (timer + overrides)
 
 #include "lvgl.h"
 #include "ui_priv.h"
@@ -32,20 +33,21 @@
 #define LOG_BOTTOM_SAFE_PAD   (LOG_BOTTOM_BTN_H + (LOG_BOTTOM_BTN_PAD * 2))
 
 /* ---------------- UI objects ---------------- */
-static lv_obj_t   *s_cont          = NULL;   // scrollable container
-static lv_obj_t   *s_label         = NULL;   // label holding log text
-static lv_timer_t *s_timer         = NULL;
-static lv_obj_t   *s_btn_bottom    = NULL;
-static lv_obj_t   *s_btn_bottom_lbl= NULL;
+static lv_obj_t   *s_cont           = NULL;   // scrollable container
+static lv_obj_t   *s_label          = NULL;   // label holding log text
+static lv_timer_t *s_timer          = NULL;
+static lv_obj_t   *s_btn_bottom     = NULL;
+static lv_obj_t   *s_btn_bottom_lbl = NULL;
+static int         s_log_to_token   = -1;
 
 /* ---------------- Autoscroll state ---------------- */
-static bool s_autoscroll      = true;   // follow tail by default
-static bool s_user_scrolling  = false;  // true while finger is down / scroll in progress
+static bool s_autoscroll     = true;   // follow tail by default
+static bool s_user_scrolling = false;  // true while finger is down / scroll in progress
 
 /* ---------------- UI-side ring buffer ---------------- */
 static char   s_ring[LOG_UI_RING_CHARS];
-static size_t s_ring_head     = 0;
-static bool   s_ring_wrapped  = false;
+static size_t s_ring_head    = 0;
+static bool   s_ring_wrapped = false;
 
 /* contiguous view buffer for label */
 static char s_view[LOG_UI_RING_CHARS + 1];
@@ -53,18 +55,35 @@ static char s_view[LOG_UI_RING_CHARS + 1];
 /* last observed seq from stream */
 static uint32_t s_last_seq = 0;
 
+/* CRLF handling */
+static bool s_prev_was_cr = false;
+
 /* ---------------- Forward decls ---------------- */
-static bool   cont_is_at_bottom(void);
-static void   cont_scroll_to_bottom(void);
-static void   bottom_btn_update_visible(void);
-static void   scroll_to_bottom_oneshot(lv_timer_t *t);
+static bool cont_is_at_bottom(void);
+static void cont_scroll_to_bottom(void);
+static void bottom_btn_update_visible(void);
+static void scroll_to_bottom_oneshot(lv_timer_t *t);
+static void log_screen_enter_always_on(void);
+static void log_screen_exit_always_on(void);
+static void on_log_screen_delete(lv_event_t *e);
 
 /* ---------------- Helpers ---------------- */
 
 static inline bool log_char_ok(char *c_inout)
 {
     char c = *c_inout;
-    if (c == '\r') c = '\n';
+
+    /* Convert CR to LF, and swallow LF if we already emitted LF for CRLF */
+    if (c == '\r') {
+        s_prev_was_cr = true;
+        c = '\n';
+    } else {
+        if (s_prev_was_cr && c == '\n') {
+            s_prev_was_cr = false;
+            return false; // swallow LF in CRLF
+        }
+        s_prev_was_cr = false;
+    }
 
     unsigned char uc = (unsigned char)c;
     if (c == '\n' || c == '\t') { *c_inout = c; return true; }
@@ -72,11 +91,30 @@ static inline bool log_char_ok(char *c_inout)
     return false;
 }
 
+static void log_screen_enter_always_on(void)
+{
+    if (s_log_to_token < 0) {
+        s_log_to_token = screen_timeout_push_override_ms(0); // never timeout while on this screen
+        screen_timeout_mark_activity();
+    }
+}
+
+static void log_screen_exit_always_on(void)
+{
+    if (s_log_to_token >= 0) {
+        screen_timeout_pop_override(s_log_to_token);
+        s_log_to_token = -1;
+        screen_timeout_mark_activity();
+    }
+}
+
 static void ring_reset(void)
 {
     s_ring_head = 0;
     s_ring_wrapped = false;
+    s_prev_was_cr = false;
     memset(s_ring, 0, sizeof(s_ring));
+    s_view[0] = '\0';
 }
 
 static inline void ring_put_char(char c)
@@ -144,17 +182,17 @@ static bool cont_is_at_bottom(void)
     return (lv_obj_get_scroll_bottom(s_cont) <= LOG_SCROLL_THRESH_PX);
 }
 
-/* Always scroll container to its bottom-most scroll position.
-   IMPORTANT: lv_obj_get_scroll_bottom() is a distance; the bottom offset is -distance (top is 0). */
+/* Scroll down by remaining distance to bottom (relative, non-toggling) */
 static void cont_scroll_to_bottom(void)
 {
     if (!s_cont) return;
 
-    /* Ensure scroll range is up to date */
     lv_obj_update_layout(s_cont);
 
-    lv_coord_t bottom_dist = lv_obj_get_scroll_bottom(s_cont);
-    lv_obj_scroll_to_y(s_cont, bottom_dist, LV_ANIM_OFF);
+    lv_coord_t bottom = lv_obj_get_scroll_bottom(s_cont);
+    if (bottom > 0) {
+        lv_obj_scroll_by(s_cont, 0, -bottom, LV_ANIM_OFF);
+    }
 }
 
 static void bottom_btn_update_visible(void)
@@ -173,10 +211,8 @@ static void scroll_to_bottom_oneshot(lv_timer_t *t)
 {
     (void)t;
 
-    /* Some ports need one extra pass for layout to settle.
-       Two calls are cheap and makes this rock-solid. */
     cont_scroll_to_bottom();
-    cont_scroll_to_bottom();
+    cont_scroll_to_bottom(); /* extra pass for ports where layout settles a tick later */
 
     s_autoscroll = true;
     s_user_scrolling = false;
@@ -190,6 +226,8 @@ static void scroll_to_bottom_oneshot(lv_timer_t *t)
 static void on_log_back(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    /* This triggers screen delete for current screen, which will clean up */
     ui_show(UI_HOME);
 }
 
@@ -197,7 +235,6 @@ static void on_bottom_btn(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-    /* Re-enable follow mode and jump to tail */
     s_user_scrolling = false;
     s_autoscroll = true;
 
@@ -211,13 +248,13 @@ static void on_cont_scroll(lv_event_t *e)
 
     if (code == LV_EVENT_SCROLL_BEGIN) {
         s_user_scrolling = true;
-        /* don't change s_autoscroll yet; user might still be at bottom */
         bottom_btn_update_visible();
         return;
     }
 
     if (code == LV_EVENT_SCROLL_END) {
         s_user_scrolling = false;
+
         /* follow only if they ended at bottom */
         s_autoscroll = cont_is_at_bottom();
         bottom_btn_update_visible();
@@ -227,29 +264,34 @@ static void on_cont_scroll(lv_event_t *e)
     if (code == LV_EVENT_SCROLL) {
         /* while moving, disable follow if they leave bottom */
         if (!cont_is_at_bottom()) s_autoscroll = false;
-        else s_autoscroll = true;
-
         bottom_btn_update_visible();
     }
 }
-static int s_log_to_token = -1;   // move this to file-scope, not inside ui_build_log_screen
 
 static void on_log_screen_delete(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_DELETE) return;
 
-    if (s_log_to_token >= 0) {
-        screen_timeout_pop_override(s_log_to_token);
-        s_log_to_token = -1;
-        screen_timeout_mark_activity(); // recompute deadline with default timeout
+    /* Always-on override back to normal */
+    log_screen_exit_always_on();
+
+    /* Stop & delete timer (prevents stale callbacks when screen recreated) */
+    if (s_timer) {
+        lv_timer_del(s_timer);
+        s_timer = NULL;
     }
 
+    /* Clear pointers so callbacks can’t use freed objects */
     s_cont = NULL;
     s_label = NULL;
     s_btn_bottom = NULL;
     s_btn_bottom_lbl = NULL;
 
-    if (s_timer) lv_timer_pause(s_timer);
+    /* Reset state so reopening is clean */
+    ring_reset();
+    s_autoscroll = true;
+    s_user_scrolling = false;
+    s_last_seq = 0;
 }
 
 /* ---------------- Timer callback ---------------- */
@@ -259,17 +301,9 @@ static void log_refresh_cb(lv_timer_t *t)
     (void)t;
     if (!s_label || !s_cont) return;
 
-    /* Follow tail only if user is at bottom (or returns to bottom) */
-    bool at_bottom_now = cont_is_at_bottom();
-    if (!s_user_scrolling) {
-        if (!at_bottom_now) s_autoscroll = false;
-        else s_autoscroll = true;
-    }
-
     /* Gate by stream seq */
     uint32_t seq = watch_logstream_seq();
     if (seq == s_last_seq) {
-        /* still keep bottom button honest while user scrolls */
         bottom_btn_update_visible();
         return;
     }
@@ -282,10 +316,13 @@ static void log_refresh_cb(lv_timer_t *t)
         return;
     }
 
-    /* Render once (static pointer into s_view; we rebuild on each tick) */
+    /* Update label text */
     const char *view = ring_build_view();
     lv_label_set_text_static(s_label, view);
-    lv_obj_set_width(s_label, lv_obj_get_width(s_cont));
+
+    /* IMPORTANT: ensure label height/layout updated before scrolling */
+    lv_obj_update_layout(s_label);
+    lv_obj_update_layout(s_cont);
 
     if (s_autoscroll && !s_user_scrolling) {
         cont_scroll_to_bottom();
@@ -349,7 +386,7 @@ lv_obj_t *ui_build_log_screen(void)
 
     /* log label */
     s_label = lv_label_create(s_cont);
-    lv_obj_set_width(s_label, lv_obj_get_width(s_cont));
+    lv_obj_set_width(s_label, lv_pct(100));
     lv_label_set_long_mode(s_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_color(s_label, UI_COLOR(THEME), 0);
     lv_obj_set_style_text_font(s_label, LV_FONT_DEFAULT, 0);
@@ -370,7 +407,6 @@ lv_obj_t *ui_build_log_screen(void)
     lv_obj_set_style_text_color(s_btn_bottom_lbl, UI_COLOR(THEME), 0);
     lv_obj_center(s_btn_bottom_lbl);
 
-    /* start hidden (we will show it if user scrolls up) */
     lv_obj_add_flag(s_btn_bottom, LV_OBJ_FLAG_HIDDEN);
 
     /* reset viewer state */
@@ -380,24 +416,21 @@ lv_obj_t *ui_build_log_screen(void)
     s_last_seq = 0;
 
     /* timer */
-    if (!s_timer) {
-        s_timer = lv_timer_create(log_refresh_cb, LOG_REFRESH_MS, NULL);
-    } else {
-        lv_timer_set_period(s_timer, LOG_REFRESH_MS);
-    }
+    s_timer = lv_timer_create(log_refresh_cb, LOG_REFRESH_MS, NULL);
 
     /* ---- Initial population (bounded, non-blocking) ---- */
     size_t appended = 0;
     for (int i = 0; i < 6; i++) {
-        appended += log_drain_once(LOG_APPEND_MAX);
-        /* probe: if nothing left right now, stop */
-        if (watch_logstream_read((char[2]){0}, 2) == 0) break;
+        size_t a = log_drain_once(LOG_APPEND_MAX);
+        appended += a;
+        if (a == 0) break;
     }
 
     if (appended) {
         const char *view = ring_build_view();
         lv_label_set_text_static(s_label, view);
-        lv_obj_set_width(s_label, lv_obj_get_width(s_cont));
+        lv_obj_update_layout(s_label);
+        lv_obj_update_layout(s_cont);
     }
 
     /* Start ticking + force scroll to bottom after layout settles */
@@ -405,8 +438,7 @@ lv_obj_t *ui_build_log_screen(void)
     lv_timer_resume(s_timer);
 
     lv_timer_create(scroll_to_bottom_oneshot, 1, NULL);
-    s_log_to_token = screen_timeout_push_override_ms(0); // always on
-    screen_timeout_mark_activity();
+    log_screen_enter_always_on();
 
     return scr;
 }

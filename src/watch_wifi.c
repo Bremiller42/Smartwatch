@@ -139,7 +139,7 @@ static void wifi_event_handler(void *arg,
 
         // Time sync
         sntp_start();
-
+        weather_request_update();
         return;
     }
 

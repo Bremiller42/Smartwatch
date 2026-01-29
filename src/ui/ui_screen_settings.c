@@ -459,7 +459,7 @@ lv_obj_t *ui_build_settings_screen(void)
     lv_label_set_text(btxt, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(btxt, lv_color_white(), 0);
     lv_obj_center(btxt);
-    
+
     // ABOUT GRID
     lv_obj_t *g_about = lv_obj_create(tab_about);
     lv_obj_set_size(g_about, lv_pct(100), lv_pct(100));
