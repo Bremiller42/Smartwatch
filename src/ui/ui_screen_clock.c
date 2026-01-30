@@ -16,6 +16,7 @@ static lv_obj_t *hr_bpm_lbl    = NULL;
 static lv_obj_t *hr_prog_arc   = NULL;
 static lv_obj_t *wx_temp_lbl = NULL;
 static lv_obj_t *wx_hum_lbl  = NULL;
+static lv_obj_t *wx_hum_icon = NULL;
 static lv_obj_t *wx_icon_main = NULL;  // lv_img
 static lv_obj_t *wx_icon_wind = NULL;  // lv_img
 
@@ -79,8 +80,8 @@ static void wx_refresh_async(void *arg)
 
     weather_snapshot_t s;
     if (!weather_get_latest(&s) || !s.valid) {
-        if (wx_temp_lbl) lv_label_set_text(wx_temp_lbl, "--");
-        if (wx_hum_lbl)  lv_label_set_text(wx_hum_lbl,  "--");
+        if (wx_temp_lbl) lv_label_set_text(wx_temp_lbl, "----");
+        if (wx_hum_lbl)  lv_label_set_text(wx_hum_lbl,  "----");
         if (wx_icon_main) lv_img_set_src(wx_icon_main, &icon_cloud_regular_42);
         if (wx_icon_wind) lv_obj_add_flag(wx_icon_wind, LV_OBJ_FLAG_HIDDEN);
         return;
@@ -136,14 +137,68 @@ static void wx_on_weather_update_cb(const weather_snapshot_t *snap)
 static void on_hr_read_now(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    if (!hr_allowed_by_power()) {
+        // optional small haptic/flash message later
+        ui_hr_widget_refresh_request();
+        return;
+    }
+
     hr_request_read_now();
     mark_user_activity();
 }
+
+
+static void ui_hr_set_enabled(bool en)
+{
+    if (!hr_btn || !hr_btn_icon || !hr_status_lbl || !hr_bpm_lbl || !hr_prog_arc) return;
+
+    if (en) {
+        // enable interaction
+        lv_obj_clear_state(hr_btn, LV_STATE_DISABLED);
+        lv_obj_add_flag(hr_btn, LV_OBJ_FLAG_CLICKABLE);
+
+        // colors back
+        lv_obj_set_style_bg_opa(hr_btn, LV_OPA_50, 0);
+        lv_obj_set_style_img_recolor_opa(hr_btn_icon, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_opa(hr_status_lbl, LV_OPA_80, 0);
+        lv_obj_set_style_text_opa(hr_bpm_lbl, LV_OPA_COVER, 0);
+
+        // restore theme-ish colors
+        lv_obj_set_style_text_color(hr_status_lbl, UI_COLOR(RED), 0);
+        lv_obj_set_style_text_color(hr_bpm_lbl, UI_COLOR(RED), 0);
+        lv_obj_set_style_img_recolor(hr_btn_icon, UI_COLOR(RED), 0);
+    } else {
+        // disable interaction
+        lv_obj_add_state(hr_btn, LV_STATE_DISABLED);
+
+        // visually grey
+        lv_obj_set_style_bg_opa(hr_btn, LV_OPA_20, 0);
+        lv_obj_set_style_img_recolor(hr_btn_icon, lv_color_hex(0x777777), 0);
+        lv_obj_set_style_img_recolor_opa(hr_btn_icon, LV_OPA_COVER, 0);
+
+        lv_obj_set_style_text_color(hr_status_lbl, lv_color_hex(0x777777), 0);
+        lv_obj_set_style_text_color(hr_bpm_lbl,    lv_color_hex(0x777777), 0);
+
+        // optional: force text to "Disabled"
+        lv_label_set_text(hr_status_lbl, "HR: Power Save");
+        lv_label_set_text(hr_bpm_lbl, "---");
+
+        // hide progress
+        lv_obj_add_flag(hr_prog_arc, LV_OBJ_FLAG_HIDDEN);
+        lv_arc_set_value(hr_prog_arc, 0);
+    }
+}
+
+
+
 static void ui_hr_widget_refresh_async(void *arg)
 {
     (void)arg;
     if (!hr_status_lbl || !hr_bpm_lbl || !hr_prog_arc) return;
-
+    bool ok = hr_allowed_by_power();
+    ui_hr_set_enabled(ok);
+    if (!ok) return;   // stop here so normal HR states don't overwrite "Power Save"
     hr_ui_status_t st;
     hr_get_ui_status(&st);
 
@@ -164,7 +219,7 @@ static void ui_hr_widget_refresh_async(void *arg)
         snprintf(b, sizeof(b), "%.0f", st.bpm_current);
         lv_label_set_text(hr_bpm_lbl, b);
     } else {
-        lv_label_set_text(hr_bpm_lbl, "--");
+        lv_label_set_text(hr_bpm_lbl, "---");
     }
     
     // Progress arc
@@ -234,58 +289,71 @@ lv_obj_t *ui_build_clock_screen(void)
     lv_obj_set_style_text_align(phone_batt_lbl, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_align_to(phone_batt_lbl, scr, LV_ALIGN_LEFT_MID, -20, -55);
 
-    // --- Big BPM ---
-    hr_bpm_lbl = lv_label_create(scr);
-    lv_label_set_text(hr_bpm_lbl, "--");
-    lv_obj_set_style_text_color(hr_bpm_lbl, UI_COLOR(RED), 0);
-    lv_obj_set_style_text_font(hr_bpm_lbl, &lv_font_montserrat_26, 0);
-    lv_obj_align(hr_bpm_lbl, LV_ALIGN_RIGHT_MID, -18, 10);
-
-    // --- Heart rate status text ---
-    hr_status_lbl = lv_label_create(scr);
-    lv_label_set_text(hr_status_lbl, "HR: Idle");
-    lv_obj_set_style_text_color(hr_status_lbl, UI_COLOR(RED), 0);
-    lv_obj_set_style_text_font(hr_status_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_opa(hr_status_lbl, LV_OPA_80, 0);
-    lv_obj_set_style_text_align(hr_status_lbl, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_align_to(hr_status_lbl, hr_bpm_lbl, LV_ALIGN_OUT_TOP_MID, -80, -10);
-
-    // --- Progress arc (hidden unless measuring) ---
-    // Create AFTER hr_bpm_lbl exists, then center it on that label.
-    hr_prog_arc = lv_arc_create(scr);
-    lv_obj_set_size(hr_prog_arc, 40, 40);
-    lv_arc_set_rotation(hr_prog_arc, 270);
-    lv_arc_set_bg_angles(hr_prog_arc, 0, 360);
-    lv_arc_set_range(hr_prog_arc, 0, 100);
-    lv_arc_set_value(hr_prog_arc, 0);
-    lv_obj_set_style_arc_width(hr_prog_arc, 6, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(hr_prog_arc, 6, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(hr_prog_arc, UI_COLOR(RED), LV_PART_INDICATOR);
-    // ✅ Center arc over BPM label (this is what you wanted)
-    lv_obj_align_to(hr_prog_arc, hr_bpm_lbl, LV_ALIGN_CENTER, 0, 0);
-
-    lv_obj_add_flag(hr_prog_arc, LV_OBJ_FLAG_HIDDEN);
-
-
+    // =============================
+    // Heart Rate cluster (anchor: button @ mid-right)
+    // =============================
     hr_btn = lv_btn_create(scr);
     lv_obj_set_size(hr_btn, 44, 44);
     lv_obj_set_style_radius(hr_btn, 10, 0);
     lv_obj_set_style_bg_color(hr_btn, UI_COLOR(BLACK), 0);
     lv_obj_set_style_bg_opa(hr_btn, LV_OPA_50, 0);
     lv_obj_set_style_border_width(hr_btn, 1, 0);
-    lv_obj_set_style_border_color(hr_btn, lv_color_hex(0x404040), 0);
     lv_obj_clear_flag(hr_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(hr_btn, on_hr_read_now, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_align_to(hr_btn, hr_bpm_lbl, LV_ALIGN_LEFT_MID, -75, 0);
+    // Anchor HR button to middle-right
+    lv_obj_align(hr_btn, LV_ALIGN_RIGHT_MID, -12, 10);
 
     hr_btn_icon = lv_img_create(hr_btn);
     lv_img_set_src(hr_btn_icon, &heart_pulse_solid_full_a8_32);
     lv_obj_center(hr_btn_icon);
-    lv_obj_set_style_img_recolor(hr_btn_icon, UI_COLOR(RED), 0);
     lv_obj_set_style_img_recolor_opa(hr_btn_icon, LV_OPA_COVER, 0);
     lv_obj_set_style_img_recolor(hr_btn_icon, lv_color_hex(0xFF5555), LV_STATE_PRESSED);
 
+    // --- Big BPM (left of button) ---
+    hr_bpm_lbl = lv_label_create(scr);
+    // Fixed width box + right-justified text
+    lv_obj_set_width(hr_bpm_lbl, 80);
+    lv_obj_set_style_text_align(hr_bpm_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(hr_bpm_lbl, LV_LABEL_LONG_CLIP);
+    lv_obj_align_to(hr_bpm_lbl, hr_btn, LV_ALIGN_OUT_LEFT_MID, -10, -10);
+
+    lv_label_set_text(hr_bpm_lbl, "---");
+    lv_obj_set_style_text_font(hr_bpm_lbl, &lv_font_montserrat_26, 0);
+
+    // --- Progress arc (centered over BPM) ---
+    hr_prog_arc = lv_arc_create(scr);
+    lv_obj_set_size(hr_prog_arc, 50, 50);
+    lv_arc_set_rotation(hr_prog_arc, 270);
+    lv_arc_set_bg_angles(hr_prog_arc, 0, 360);
+    lv_arc_set_range(hr_prog_arc, 0, 100);
+    lv_arc_set_value(hr_prog_arc, 0);
+    lv_obj_set_style_arc_width(hr_prog_arc, 6, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(hr_prog_arc, 6, LV_PART_INDICATOR);
+
+    // Make arc fill RED, hide knob/"bubble"
+    lv_obj_set_style_arc_color(hr_prog_arc, UI_COLOR(THEME), LV_PART_MAIN);
+
+    lv_obj_set_style_arc_color(hr_prog_arc, UI_COLOR(RED), LV_PART_INDICATOR);
+    lv_obj_set_style_opa(hr_prog_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+
+    lv_obj_align_to(hr_prog_arc, hr_btn, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(hr_prog_arc, LV_OBJ_FLAG_HIDDEN);
+
+    // --- Status (above both; right edge aligned to button right) ---
+    hr_status_lbl = lv_label_create(scr);
+    lv_label_set_text(hr_status_lbl, "HR: Idle");
+    lv_obj_set_style_text_font(hr_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_opa(hr_status_lbl, LV_OPA_80, 0);
+
+    // Fixed width box + right-justified text
+    lv_obj_set_width(hr_status_lbl, 160);
+    lv_obj_set_style_text_align(hr_status_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(hr_status_lbl, LV_LABEL_LONG_CLIP);
+
+    // Anchor status ABOVE the button, but keep it spanning over bpm+btn
+    // (right edge locks to button's right edge)
+    lv_obj_align_to(hr_status_lbl, hr_btn, LV_ALIGN_OUT_TOP_RIGHT, 0, -5);
 
     lv_obj_t *menu = lv_btn_create(scr);
     lv_obj_set_size(menu, 90, 50);
@@ -296,41 +364,60 @@ lv_obj_t *ui_build_clock_screen(void)
     lv_obj_add_event_cb(menu, on_back_to_home, LV_EVENT_CLICKED, NULL);
     lv_label_set_text(lv_label_create(menu), LV_SYMBOL_HOME);
     lv_obj_center(lv_obj_get_child(menu, 0));
+    // =============================
+    // Weather cluster (anchor: bottom-right)
+    // bottom->top: humidity, temp, icons row (wind + main)
+    // =============================
 
-    // ---- Weather block (anchored under HR button) ----
+    // Humidity (bottom-right)
+    wx_hum_lbl = lv_label_create(scr);
+    lv_obj_set_width(wx_hum_lbl, 40);
+    lv_obj_set_style_text_align(wx_hum_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(wx_hum_lbl, LV_LABEL_LONG_CLIP);
+
+    lv_obj_set_style_text_font(wx_hum_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(wx_hum_lbl, UI_COLOR(THEME), 0);
+    lv_obj_set_style_text_opa(wx_hum_lbl, LV_OPA_COVER, 0);
+    lv_label_set_text(wx_hum_lbl, "----");
+    lv_obj_align(wx_hum_lbl, LV_ALIGN_BOTTOM_RIGHT, -12, -18);
+
+    wx_hum_icon = lv_img_create(scr);
+    lv_img_set_src(wx_hum_icon, &droplet_solid_full_a8_20);
+    lv_obj_set_style_img_recolor_opa(wx_hum_icon, LV_OPA_90, 0);
+    lv_obj_set_style_img_recolor(wx_hum_icon, UI_COLOR(THEME), 0);
+    lv_obj_align_to(wx_hum_icon, wx_hum_lbl, LV_ALIGN_OUT_LEFT_MID, -7, 0);
+    lv_obj_set_style_bg_opa(wx_hum_icon, LV_OPA_0, 0);
+    lv_obj_move_background(wx_hum_icon);
+    lv_obj_move_foreground(wx_hum_lbl);
+
+    // Temp (above humidity)
+    wx_temp_lbl = lv_label_create(scr);
+    lv_obj_set_width(wx_temp_lbl, 60);
+    lv_obj_set_style_text_align(wx_temp_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(wx_temp_lbl, LV_LABEL_LONG_CLIP);
+
+    lv_obj_set_style_text_font(wx_temp_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(wx_temp_lbl, UI_COLOR(WHITE), 0);
+    lv_label_set_text(wx_temp_lbl, "--°F");
+    lv_obj_align_to(wx_temp_lbl, wx_hum_lbl, LV_ALIGN_OUT_TOP_RIGHT, -5, -4);
+
+    // Icons row (above temp): wind + main side-by-side
     wx_icon_main = lv_img_create(scr);
     lv_img_set_src(wx_icon_main, &icon_cloud_regular_42);
     lv_obj_set_style_img_recolor(wx_icon_main, UI_COLOR(WHITE), 0);
     lv_obj_set_style_img_recolor_opa(wx_icon_main, LV_OPA_COVER, 0);
 
-    // ✅ anchor main icon under HR button
-    lv_obj_align_to(wx_icon_main, hr_btn, LV_ALIGN_OUT_BOTTOM_MID, 70, 10);
+    // Anchor main icon above temp, right aligned
+    lv_obj_align_to(wx_icon_main, wx_temp_lbl, LV_ALIGN_OUT_TOP_RIGHT, 0, -6);
 
     wx_icon_wind = lv_img_create(scr);
     lv_img_set_src(wx_icon_wind, &icon_wind_solid_42);
     lv_obj_set_style_img_recolor(wx_icon_wind, UI_COLOR(THEME), 0);
     lv_obj_set_style_img_recolor_opa(wx_icon_wind, LV_OPA_COVER, 0);
 
-    // ✅ wind sits to the LEFT of main icon
+    // Wind sits to the LEFT of main icon
     lv_obj_align_to(wx_icon_wind, wx_icon_main, LV_ALIGN_OUT_LEFT_MID, -8, 0);
     lv_obj_add_flag(wx_icon_wind, LV_OBJ_FLAG_HIDDEN);
-
-    wx_temp_lbl = lv_label_create(scr);
-    lv_obj_set_style_text_font(wx_temp_lbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(wx_temp_lbl, UI_COLOR(WHITE), 0);
-    lv_label_set_text(wx_temp_lbl, "--");
-
-    // Temp just under the main weather icon
-    lv_obj_align_to(wx_temp_lbl, wx_icon_main, LV_ALIGN_OUT_BOTTOM_MID, -35, 2);
-
-    wx_hum_lbl = lv_label_create(scr);
-    lv_obj_set_style_text_font(wx_hum_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(wx_hum_lbl, UI_COLOR(THEME), 0);
-    lv_obj_set_style_text_opa(wx_hum_lbl, LV_OPA_80, 0);
-    lv_label_set_text(wx_hum_lbl, "--");
-
-    // Humidity under temp
-    lv_obj_align_to(wx_hum_lbl, wx_temp_lbl, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
 
 
     ui_set_watch_batt(g_watch_batt_pct, g_watch_batt_v);
@@ -338,7 +425,7 @@ lv_obj_t *ui_build_clock_screen(void)
     clock_update_wifi_icon_now();
     clock_update_ble_icon_now();
 
-        // Register weather update callback once
+    // Register weather update callback once
     if (!s_wx_cb_registered) {
         weather_register_cb(wx_on_weather_update_cb);
         s_wx_cb_registered = true;
@@ -352,8 +439,13 @@ lv_obj_t *ui_build_clock_screen(void)
     weather_request_update();
 
     ui_notif_bar_attach(scr);
-    ui_hr_widget_refresh_request();
     ui_set_watch_batt(g_watch_batt_pct, g_watch_batt_v);
+    // Force initial HR widget state immediately (not async)
+    ui_hr_set_enabled(hr_allowed_by_power());
+
+    // Also apply the correct text/progress immediately if you want:
+    ui_hr_widget_refresh_request();
+
     ui_notif_refresh_async();
 
     if (clock_timer == NULL) {

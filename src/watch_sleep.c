@@ -48,7 +48,7 @@
 #include "watch_screen_timeout.h"
 #include "watch_backlight.h"
 #include "lv_port.h"          // lvgl_port_pause/resume
-
+#include "ui/ui_priv.h"
 // Battery policy integration
 #include "watch_shutdown.h"
 
@@ -73,6 +73,9 @@ static uint32_t g_deep_sleep_delay_ms = 20 * 60 * 1000; // 20 min default
 
 static TaskHandle_t s_sleep_task = NULL;
 
+static bool s_ao_wanted_enabled   = true;
+static bool s_ao_wanted_force_off = false;
+static bool s_ao_async_pending    = false;
 /* Internals */
 static volatile bool s_touch_pending = false;
 static volatile uint32_t s_touch_irq_count = 0;
@@ -94,6 +97,59 @@ static sleep_stage_t s_radio_stage = SLP_AWAKE;
 static bool s_lvgl_paused = false;
 
 static void manager_cb(lv_timer_t *t);
+
+typedef struct {
+    bool enabled;
+    bool force_off;
+} ui_ao_args_t;
+
+static void ui_set_always_on_tile_async(void *arg)
+{
+    ui_ao_args_t *a = (ui_ao_args_t*)arg;
+    ui_settings_set_always_on_tile_enabled(a->enabled, a->force_off);
+    lv_mem_free(a);
+
+    s_ao_async_pending = false;   // ✅ allow future updates
+}
+
+
+// Keep your existing typedef + async callback:
+// typedef struct { bool enabled; bool force_off; } ui_ao_args_t;
+// static void ui_set_always_on_tile_async(void *arg) { ... }
+
+
+static void ui_set_always_on_tile(bool enabled, bool force_off)
+{
+    // Edge-trigger: only act on change
+    if (s_ao_wanted_enabled == enabled && s_ao_wanted_force_off == force_off) {
+        return;
+    }
+
+    s_ao_wanted_enabled   = enabled;
+    s_ao_wanted_force_off = force_off;
+
+    // If LVGL is paused, DO NOT allocate or queue async work.
+    // Defer until wake (we'll flush it in screen_wake_local()).
+    if (s_lvgl_paused) {
+        s_ao_async_pending = true;
+        return;
+    }
+
+    // If one is already pending, don't enqueue another.
+    if (s_ao_async_pending) {
+        return;
+    }
+
+    ui_ao_args_t *a = lv_mem_alloc(sizeof(*a));
+    if (!a) return;
+
+    a->enabled   = enabled;
+    a->force_off = force_off;
+
+    s_ao_async_pending = true;
+    lv_async_call(ui_set_always_on_tile_async, a);
+}
+
 
 static inline uint32_t now_ms(void)
 {
@@ -140,6 +196,8 @@ static power_policy_t policy_compute(uint32_t idle_ms)
         if (p.screen_timeout_ms == 0 || p.screen_timeout_ms > 15000) p.screen_timeout_ms = 15000;
         if (p.wifi_off_delay_ms > 30000) p.wifi_off_delay_ms = 30000;
         if (p.ble_slow_delay_ms > 20000) p.ble_slow_delay_ms = 20000;
+        ui_set_always_on_tile(false, true);   // disable + force off
+
     }
 
     if (criticalish) {
@@ -150,13 +208,17 @@ static power_policy_t policy_compute(uint32_t idle_ms)
         // Get screen off quickly once idle
         // (If you want immediate screen-off in critical, set this to true unconditionally.)
         p.force_screen_off = (idle_ms >= 3000);
+        ui_set_always_on_tile(false, true);   // disable + force off
 
         // Hard clamps (so should_screen_off triggers quickly)
         p.screen_timeout_ms = 3000;
         p.wifi_off_delay_ms = 0;
         p.ble_slow_delay_ms = 0;
     }
-
+    if (!criticalish && st != SHDN_LOW && !latched) {
+        // re-enable tile if previously disabled
+        ui_set_always_on_tile(true, false);
+    }
     return p;
 }
 
@@ -229,10 +291,23 @@ static void screen_wake_local(void)
     // NOTE: per your comment: LEAVE FALSE; BSP function behaves like a toggle in your build.
     bsp_display_panel_on(false);
 
-    // 2) Resume LVGL
     if (s_lvgl_paused) {
-        (void)lvgl_port_resume();
-        s_lvgl_paused = false;
+    (void)lvgl_port_resume();
+    s_lvgl_paused = false;
+    }
+
+    // ✅ If we deferred a tile update during sleep, push it now.
+    if (s_ao_async_pending) {
+        // we stored the "wanted" state already; enqueue once
+        ui_ao_args_t *a = lv_mem_alloc(sizeof(*a));
+        if (a) {
+            a->enabled   = s_ao_wanted_enabled;
+            a->force_off = s_ao_wanted_force_off;
+            lv_async_call(ui_set_always_on_tile_async, a);
+            // keep s_ao_async_pending true until callback runs
+        } else {
+            // If alloc fails, leave pending true; we'll try again next wake tick.
+        }
     }
 
     // 3) Resume TE (ungate sync)
@@ -404,6 +479,7 @@ static void manager_cb(lv_timer_t *t)
     } else if (!s_screen_forced_off_by_timeout) {
         screen_wake_local();
     }
+
 
     /* 2) Perf follows screen state ONLY */
     apply_perf_state(g_screen_awake);

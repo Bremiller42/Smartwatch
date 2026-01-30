@@ -7,7 +7,8 @@
 #include "watch_globals.h"
 #include "watch_heartrate.h"
 #include "watch_weather.h"
-
+#include "watch_sleep.h"
+#include "watch_shutdown.h"
 static const char *UI_SS_TAG = "UI_SETTINGS";
 
 /* local (settings-only) labels */
@@ -74,6 +75,8 @@ static void weather_update_subtitle_async(void *arg)
 }
 
 
+
+
 static void on_weather_tile_clicked(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -112,6 +115,12 @@ static void always_on_update_subtitle(void)
 
 static void on_timeout_tile_clicked(lv_event_t *e)
 {
+    if (watch_shutdown_state() == SHDN_LOW || watch_shutdown_low_power_latched()) {
+        // show "Disabled" or ignore tap
+        mark_user_activity();
+        return;
+    }
+
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
     // Choosing a timeout implies leaving always-on mode
@@ -132,7 +141,35 @@ static void on_timeout_tile_clicked(lv_event_t *e)
     timeout_update_subtitle();
     mark_user_activity();
 }
+void ui_settings_set_always_on_tile_enabled(bool enabled, bool force_off)
+{
+    if (!t_always_on) return;
 
+    if (enabled) {
+        lv_obj_clear_state(t_always_on, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(t_always_on, LV_OPA_COVER, 0);
+        // restore visual based on real state
+        tile_set_on(t_always_on, screen_timeout_get_always_on());
+        always_on_update_subtitle();
+        return;
+    }
+
+    // disable interactions
+    lv_obj_add_state(t_always_on, LV_STATE_DISABLED);
+    lv_obj_set_style_opa(t_always_on, LV_OPA_50, 0);
+
+    // optionally force it OFF visually and logically
+    if (force_off) {
+        screen_timeout_set_always_on(false);
+        settings_save_screen_always_on(false);
+        tile_set_on(t_always_on, false);
+        always_on_update_subtitle();
+        timeout_update_subtitle();
+    } else {
+        tile_set_on(t_always_on, false); // purely visual "not available"
+        lv_label_set_text(always_on_sub_lbl, "Disabled");
+    }
+}
 static void on_always_on_tile_clicked(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;

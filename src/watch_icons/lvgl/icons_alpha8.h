@@ -79,3 +79,5 @@
 #include "rotate_left_solid_full_a8_50.h"
 #include "power_off_solid_full_a8_50.h"
 #include "moon_solid_full_a8_42.h"
+
+#include "droplet_solid_full_a8_20.h"

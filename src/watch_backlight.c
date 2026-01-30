@@ -45,19 +45,20 @@ void backlight_apply_now(void)
 
 void backlight_init(int persisted_user_pct)
 {
-    s_user_pct  = clamp_pct(persisted_user_pct);
-    if (s_user_pct < 10) {
-        s_user_pct = 10; // minimum user brightness
-        g_brightness = s_user_pct; // update global
-    }
+    s_user_pct = clamp_pct(persisted_user_pct);
+
+    if (s_user_pct < 10) s_user_pct = 10;
+
+    // always mirror to global
+    g_brightness = s_user_pct;
+
     s_cap_pct   = 100;
     s_screen_on = true;
 
-    ESP_LOGI(TAG, "init user=%d cap=%d eff=%d",
-             s_user_pct, s_cap_pct, effective_pct());
-
+    ESP_LOGI(TAG, "init user=%d cap=%d eff=%d", s_user_pct, s_cap_pct, effective_pct());
     backlight_apply_now();
 }
+
 
 void backlight_set_screen_on(bool on)
 {
@@ -69,11 +70,14 @@ void backlight_set_screen_on(bool on)
 void backlight_set_user_pct(int pct)
 {
     s_user_pct = clamp_pct(pct);
-    ESP_LOGI(TAG, "user set -> %d (cap=%d eff=%d)", s_user_pct, s_cap_pct, effective_pct());
 
-    // IMPORTANT: do not touch hardware directly; respect screen gating
+    // keep global in sync (global = user preference truth)
+    g_brightness = s_user_pct;
+
+    ESP_LOGI(TAG, "user set -> %d (cap=%d eff=%d)", s_user_pct, s_cap_pct, effective_pct());
     backlight_apply_now();
 }
+
 
 int backlight_get_user_pct(void)
 {

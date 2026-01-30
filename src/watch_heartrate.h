@@ -46,3 +46,4 @@ typedef struct {
 void hr_get_ui_status(hr_ui_status_t *out);   // thread-safe copy
 void ui_hr_widget_refresh_request(void);
 void hr_set_boot_bpm_current(float bpm, bool valid);
+bool hr_allowed_by_power(void);

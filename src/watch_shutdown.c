@@ -12,7 +12,7 @@
 #include "watch_wifi.h"
 #include "watch_ble.h"
 #include "watch_backlight.h"
-
+#include "watch_screen_timeout.h"
 #include "lvgl.h"
 #include "ui_priv.h"
 
@@ -119,7 +119,9 @@ static void apply_critical_actions(void)
 
     // ✅ Cap brightness more aggressively
     backlight_set_cap_pct(s_cfg.cap_pct_critical);
-
+    // ✅ Make sure timeout system can actually shut screen back off
+    screen_keep_awake_set(false);        // hard clear (refs->0)
+    screen_timeout_set_always_on(false); // just in case user had it on
     /* ✅ show low power screen as “last screen” */
     lv_async_call(ui_show_low_pwr_async, NULL);
 

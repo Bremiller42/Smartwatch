@@ -95,3 +95,5 @@
 
 #define icon_rotate_left_solid           rotate_left_solid_full_a8_50
 #define icon_power_off_solid             power_off_solid_full_a8_50
+
+#define icon_droplet_solid_20           droplet_solid_full_a8_20

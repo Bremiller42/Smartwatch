@@ -19,7 +19,7 @@ typedef struct {
 static void tile_style_base(lv_obj_t *btn)
 {
     lv_obj_set_style_radius(btn, TILE_RAD, 0);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_70, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_80, 0);
     lv_obj_set_style_border_width(btn, 2, 0);
     lv_obj_set_style_border_color(btn, UI_COLOR(THEME), 0);
     lv_obj_set_style_pad_all(btn, 12, 0);

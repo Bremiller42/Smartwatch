@@ -106,3 +106,5 @@ void ui_log_screen_pause(bool pause);
 lv_obj_t *ui_build_power_menu(void);
 lv_obj_t *ui_build_low_pwr_screen(void);
 lv_obj_t *ui_build_device_info_screen(void);
+// UI policy hooks (safe to call from non-UI modules via lv_async_call)
+void ui_settings_set_always_on_tile_enabled(bool enabled, bool force_off);

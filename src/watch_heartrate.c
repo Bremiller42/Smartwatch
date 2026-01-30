@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include <stdlib.h>
 #include "watch_screen_timeout.h"
+#include "watch_shutdown.h"
 
 #define MAX30102_ADDR           0x57
 static const char *HR_TAG = "HEART";
@@ -40,6 +41,7 @@ static int s_hr_to_token = -1;
 static uint32_t HR_AC_MIN = 30;     // wrist often low amplitude
 static uint32_t HR_DC_MIN = 20000;
 static uint32_t HR_DC_MAX = 250000;
+bool hr_allowed_by_power(void);
 
 // BPM bounds
 static float HR_BPM_MIN = 40.0f;
@@ -93,7 +95,16 @@ static hr_ui_status_t s_ui = {
     .session_ms_total = 15000,
     .bpm_last = 0,
 };
+
 static portMUX_TYPE s_ui_mux = portMUX_INITIALIZER_UNLOCKED;
+
+bool hr_allowed_by_power(void)
+{
+    const shdn_state_t st = watch_shutdown_state();
+    const bool latched = watch_shutdown_low_power_latched();
+
+    return !(st == SHDN_LOW || st == SHDN_CRITICAL || st == SHDN_SHUTTING_DOWN || latched);
+}
 
 void hr_get_ui_status(hr_ui_status_t *out)
 {
@@ -329,12 +340,26 @@ static void hr_process_sample(hr_est_t *h, ppg_filter_t *f, float ac, uint32_t n
  * ============================= */
 void hr_request_read_now(void)
 {
+    if (!hr_allowed_by_power()) {
+        ESP_LOGW(HR_TAG, "HR blocked by power state (LOW/CRITICAL/latched)");
+        // Make sure we don't hold awake if someone spam-taps
+        heart_exit_always_on();
+
+        // Optional: update UI state to show why it didn't run
+        portENTER_CRITICAL(&s_ui_mux);
+        s_ui.state = HR_STATE_IDLE;      // or add HR_STATE_BLOCKED_POWER if you want
+        s_ui.bpm_valid = false;
+        portEXIT_CRITICAL(&s_ui_mux);
+        ui_hr_widget_refresh_request();
+        return;
+    }
+
     if (s_hr_task) {
         heart_enter_always_on();
         xTaskNotifyGive(s_hr_task);
-
     }
 }
+
 
 /* =============================
  *  Task: windowed sampling
@@ -342,6 +367,7 @@ void hr_request_read_now(void)
 static void max_task(void *arg)
 {
     (void)arg;
+    
     s_hr_task = xTaskGetCurrentTaskHandle();
 
 
@@ -390,6 +416,13 @@ static void max_task(void *arg)
         last_run_start = xTaskGetTickCount();
     }
         // ---------- START WINDOW ----------
+        if (!hr_allowed_by_power()) {
+            ESP_LOGW(HR_TAG, "Skipping HR window due to power state");
+            heart_exit_always_on();            // safety: ensure not held
+            max30102_shutdown_best_effort();   // safety: if sensor was left on previously
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         err = max30102_init();
         if (err != ESP_OK) {
             s_max_present = false;

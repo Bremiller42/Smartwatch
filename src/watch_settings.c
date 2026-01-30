@@ -26,7 +26,7 @@
 #define KEY_SCREEN_ALWAYS_ON "scr_always"
 #endif
 
-static const char *SET_TAG = "GLOBALS";
+static const char *SET_TAG = "SETTINGS";
 
 // NEW: gate commits when battery is critical+
 static inline bool nvs_safe_to_commit(void)
