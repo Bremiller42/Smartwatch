@@ -6,6 +6,7 @@
 #include "watch_fuel.h"
 #include "watch_weather.h"
 #include "watch_icons/watch_icons.h"
+#include "watch_sms_store.h"
 
 static const char *UI_SC_TAG = "UI_CLOCK";
 
@@ -19,6 +20,8 @@ static lv_obj_t *wx_hum_lbl  = NULL;
 static lv_obj_t *wx_hum_icon = NULL;
 static lv_obj_t *wx_icon_main = NULL;  // lv_img
 static lv_obj_t *wx_icon_wind = NULL;  // lv_img
+static lv_obj_t *sms_btn = NULL;
+static lv_obj_t *sms_btn_icon = NULL;
 
 static bool s_wx_cb_registered = false;
 
@@ -67,6 +70,12 @@ static const void *wx_icon_for_ow_icon(const char *icon_code)
     return &icon_cloud_regular_42;
 }
 
+static void on_sms_open_overlay(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    mark_user_activity();
+    ui_show(UI_SMS_OVERLAY);
+}
 
 static bool wx_is_windy_mph10(int wind_mps_x10)
 {
@@ -418,7 +427,37 @@ lv_obj_t *ui_build_clock_screen(void)
     // Wind sits to the LEFT of main icon
     lv_obj_align_to(wx_icon_wind, wx_icon_main, LV_ALIGN_OUT_LEFT_MID, -8, 0);
     lv_obj_add_flag(wx_icon_wind, LV_OBJ_FLAG_HIDDEN);
+    // =============================
+    // SMS quick button (opens overlay)
+    // =============================
+    
+    // =============================
+    // SMS quick button (opens overlay)
+    // =============================
+    sms_btn = lv_btn_create(scr);
+    lv_obj_set_size(sms_btn, 44, 44);
+    lv_obj_set_style_radius(sms_btn, 10, 0);
+    lv_obj_set_style_bg_color(sms_btn, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(sms_btn, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(sms_btn, 1, 0);
+    lv_obj_clear_flag(sms_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(sms_btn, on_sms_open_overlay, LV_EVENT_CLICKED, NULL);
 
+    // Position: bottom mid (adjust as you like)
+    lv_obj_align(sms_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+
+    // Use an IMAGE object if you're calling lv_img_set_src()
+    sms_btn_icon = lv_img_create(sms_btn);
+
+    // IMPORTANT: this must be a real lv_img_dsc_t* you have compiled in
+    // e.g. &icon_envelope_regular_32 or whatever your icon is actually named
+    lv_img_set_src(sms_btn_icon, &icon_envelope_regular);
+
+    lv_obj_center(sms_btn_icon);
+
+    // Optional recolor
+    lv_obj_set_style_img_recolor_opa(sms_btn_icon, LV_OPA_COVER, 0);
+    lv_obj_set_style_img_recolor(sms_btn_icon, UI_COLOR(THEME), 0);
 
     ui_set_watch_batt(g_watch_batt_pct, g_watch_batt_v);
     clock_update_label_now();

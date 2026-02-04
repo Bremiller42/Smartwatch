@@ -128,6 +128,9 @@ typedef enum {
     UI_POWER_MENU = 5,
     UI_LOW_PWR = 6,
     UI_DEVICE_INFO = 7,
+    UI_SMS_OVERLAY = 8,
+    UI_SMS_THREADS = 9,
+    UI_SMS_THREAD_VIEW = 10,
 } ui_screen_t;
 
 extern lv_obj_t *scr_blank;
@@ -137,6 +140,9 @@ extern lv_obj_t *scr_log;
 extern lv_obj_t *scr_settings;
 extern lv_obj_t *scr_power;
 extern lv_obj_t *scr_low_pwr;
+extern lv_obj_t *scr_sms_overlay;
+extern lv_obj_t *scr_sms_threads;
+extern lv_obj_t *scr_sms_thread;
 extern lv_obj_t *ui_device_info;
 extern lv_obj_t *ble_status_lbl;   // optional
 extern lv_obj_t *clock_notification_icon_box;

@@ -225,6 +225,9 @@ void setup(void)
     LOG_SECTION("Init I2C (early)");
     ESP_ERROR_CHECK(watch_i2c_init());
 
+    LOG_SECTION("Init SD task");
+    watch_sdcard_init();
+    
     LOG_SECTION("SD CARD SELF TEST");
     esp_err_t sdtest = watch_sdcard_self_test(3000);
     if (sdtest == ESP_OK) {

@@ -70,6 +70,18 @@ esp_err_t watch_sdcard_read_file(const char *path, uint8_t **out_buf, size_t *ou
  */
 esp_err_t watch_sdcard_append_line(const char *path, const char *line, uint32_t timeout_ms);
 esp_err_t watch_sdcard_self_test(uint32_t timeout_ms);
+void watch_sdcard_init(void);
+typedef esp_err_t (*watch_sd_work_fn_t)(void *ctx);
+bool watch_sdcard_is_mounted(void);
+const char *watch_sdcard_mount_point(void);
+esp_err_t watch_sdcard_get_volume_label(char *out, size_t out_sz);
+const char *watch_sdcard_volume_label_cached(void);
+const char *watch_sdcard_id_cached(void);
+// Cached, safe-to-call-from-UI getters
+const char *watch_sdcard_id_cached(void);
+
+uint64_t watch_sdcard_total_kb_cached(void);
+uint64_t watch_sdcard_free_kb_cached(void);
 
 #ifdef __cplusplus
 }

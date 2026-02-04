@@ -509,7 +509,7 @@ lv_obj_t *ui_build_settings_screen(void)
     lv_obj_clear_flag(g_about, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_grid_dsc_array(g_about, col_dsc, row_dsc);
 
-    lv_obj_t *t_devinfo = tile_create_nav_tile(g_about, "Device Info", "CPU / RAM / Battery", on_open_device_info);
+    lv_obj_t *t_devinfo = tile_create_nav_tile(g_about, "Device Info", "CPU\nRAM\nBattery", on_open_device_info);
     lv_obj_set_grid_cell(t_devinfo, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 0, 1);
 
     lv_obj_t *t_fw = tile_create_base(g_about, "Firmware", "Next", NULL);

@@ -71,6 +71,34 @@ void ui_show(ui_screen_t s)
         ui_device_info = ui_build_device_info_screen();
         lv_scr_load(ui_device_info);
     }
+    else if (s == UI_SMS_OVERLAY) {
+        // Always rebuild overlay so it shows the freshest "latest" message
+        if (scr_sms_overlay) {
+            lv_obj_del(scr_sms_overlay);
+            scr_sms_overlay = NULL;
+        }
+        scr_sms_overlay = ui_build_sms_overlay_screen();
+        lv_scr_load(scr_sms_overlay);
+    }
+    else if (s == UI_SMS_THREADS) {
+        // Rebuild so the list reflects new log data
+        if (scr_sms_threads) {
+            lv_obj_del(scr_sms_threads);
+            scr_sms_threads = NULL;
+        }
+        scr_sms_threads = ui_build_sms_threads_screen();
+        lv_scr_load(scr_sms_threads);
+    }
+    else if (s == UI_SMS_THREAD_VIEW) {
+        // Rebuild because active thread changes and messages may update
+        if (scr_sms_thread) {
+            lv_obj_del(scr_sms_thread);
+            scr_sms_thread = NULL;
+        }
+        scr_sms_thread = ui_build_sms_thread_view_screen();
+        lv_scr_load(scr_sms_thread);
+    }
+
 
     g_ui_current = s;
 }

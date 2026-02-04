@@ -26,6 +26,8 @@
 #include "host/ble_hs_adv.h"
 #include "host/ble_hs_id.h"
 #include "host/ble_sm.h"
+#include "watch_sms_store.h"
+#include "watch_b64url.h"
 
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -337,7 +339,7 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
         if (frame[0] != '\0') {
 
-            // Battery frame
+                       // Battery frame
             if (frame[0] == 'B' && frame[1] == '|') {
                 (void)parse_batt_frame(frame);
                 if (s_on_rx) s_on_rx(frame, (int)strlen(frame));
@@ -414,9 +416,52 @@ static int gatt_chr_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
                 if (s_on_rx) s_on_rx(frame, (int)strlen(frame));
             }
+            // Text/message frames (NOW at correct level)
+            else if (frame[0] == 'T' && frame[1] == '|') {
+
+                size_t wlen = strlen(frame);
+                if (wlen >= sizeof(s_work)) wlen = sizeof(s_work) - 1;
+                memcpy(s_work, frame, wlen);
+                s_work[wlen] = '\0';
+
+                char *save = NULL;
+                (void)strtok_r(s_work, "|", &save); // T
+                char *cmd   = strtok_r(NULL, "|", &save); // U
+                char *msgId = strtok_r(NULL, "|", &save);
+                char *tsMs  = strtok_r(NULL, "|", &save);
+                char *thread_b64 = strtok_r(NULL, "|", &save);
+                char *sender_b64 = strtok_r(NULL, "|", &save);
+                char *body_b64   = strtok_r(NULL, "|", &save);
+                char *pkg_b64    = strtok_r(NULL, "|", &save);
+
+                if (cmd && !strcmp(cmd, "U") &&
+                    msgId && tsMs && thread_b64 && sender_b64 && body_b64 && pkg_b64) {
+
+                    uint32_t mid = (uint32_t)strtoul(msgId, NULL, 10);
+                    uint64_t tms = (uint64_t)strtoull(tsMs, NULL, 10);
+
+                    static char thread_id[128];
+                    static char sender[96];
+                    static char body[1024];
+                    static char pkg[96];
+                    thread_id[0] = sender[0] = body[0] = pkg[0] = '\0';
+
+
+                    if (b64url_decode_to(thread_id, sizeof(thread_id), thread_b64) == ESP_OK &&
+                        b64url_decode_to(sender,    sizeof(sender),    sender_b64) == ESP_OK &&
+                        b64url_decode_to(body,      sizeof(body),      body_b64)   == ESP_OK &&
+                        b64url_decode_to(pkg,       sizeof(pkg),       pkg_b64)    == ESP_OK) {
+
+                        (void)watch_sms_store_ingest(mid, tms, thread_id, sender, body, pkg);
+                    }
+                }
+
+                if (s_on_rx) s_on_rx(frame, (int)strlen(frame));
+            }
             else {
                 if (s_on_rx) s_on_rx(frame, (int)strlen(frame));
             }
+
         }
 
         // consume processed frame
@@ -753,7 +798,7 @@ esp_err_t ble_init(ble_rx_cb_t on_rx)
         s_txq = xQueueCreate(BLE_TXQ_DEPTH, sizeof(ble_tx_item_t));
     }
     if (s_txq && !s_tx_task) {
-        xTaskCreate(ble_txq_task, "ble_txq", 4096, NULL, 5, &s_tx_task);
+        xTaskCreate(ble_txq_task, "ble_txq", 8192, NULL, 5, &s_tx_task);
     }
 
     nimble_port_freertos_init(host_task);

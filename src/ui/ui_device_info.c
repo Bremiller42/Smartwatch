@@ -18,6 +18,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include "watch_sdcard.h"
+#include "esp_log.h"
+#include "ff.h"
+
+
 
 /* Battery / drain globals */
 extern int   g_watch_batt_pct;
@@ -36,6 +41,7 @@ static lv_obj_t   *s_lbl_id     = NULL;
 static lv_obj_t   *s_lbl_uptime = NULL;
 static lv_obj_t   *s_lbl_flash  = NULL;
 static lv_obj_t   *s_lbl_fw     = NULL;
+static lv_obj_t   *s_lbl_sdcard = NULL;
 
 static lv_obj_t   *s_lbl_heap_txt   = NULL;
 static lv_obj_t   *s_lbl_psram_txt  = NULL;
@@ -46,6 +52,10 @@ static lv_obj_t   *s_lbl_batt   = NULL;
 static lv_obj_t   *s_lbl_drain  = NULL;
 
 static lv_timer_t *s_timer = NULL;
+
+static lv_obj_t *s_bar_sd       = NULL;
+static lv_obj_t *s_lbl_sd_txt   = NULL;
+
 
 /* Screen-timeout override token (matches log screen pattern) */
 static void device_info_enter_always_on(void);
@@ -69,6 +79,7 @@ static void fmt_uptime(char *out, size_t out_sz, int64_t ms)
         snprintf(out, out_sz, "%" PRId64 "m %" PRId64 "s", min, sec);
     }
 }    
+
 static void device_info_enter_always_on(void)
 {
     screen_keep_awake_acquire();
@@ -219,10 +230,13 @@ static void on_screen_delete(lv_event_t *e)
     s_lbl_psram_txt = NULL;
     s_bar_heap = NULL;
     s_bar_psram = NULL;
+    s_bar_sd = NULL;
+    s_lbl_sd_txt = NULL;
 
     s_lbl_batt = NULL;
     s_lbl_drain = NULL;
     s_lbl_fw = NULL;
+    // s_lbl_sdcard = NULL;
 
     if (s_timer) lv_timer_pause(s_timer);
 }
@@ -267,6 +281,45 @@ static void refresh_cb(lv_timer_t *t)
     if (flash_bytes > 0) snprintf(buf, sizeof(buf), "%.1f MB", (double)flash_bytes / (1024.0 * 1024.0));
     else                 snprintf(buf, sizeof(buf), "unknown");
     lv_label_set_text(s_lbl_flash, buf);
+
+    // SD Card bar + text (cached; UI thread safe)
+    if (s_bar_sd && s_lbl_sd_txt) {
+        if (!watch_sdcard_is_mounted()) {
+            lv_bar_set_value(s_bar_sd, 0, LV_ANIM_OFF);
+            lv_label_set_text(s_lbl_sd_txt, "unmounted");
+        } else {
+            uint64_t total_kb = watch_sdcard_total_kb_cached();
+            uint64_t free_kb  = watch_sdcard_free_kb_cached();
+            uint64_t used_kb  = (total_kb >= free_kb) ? (total_kb - free_kb) : 0;
+
+            int used_pct = 0;
+            if (total_kb > 0) {
+                used_pct = (int)((used_kb * 100ULL) / total_kb);
+                if (used_pct < 0) used_pct = 0;
+                if (used_pct > 100) used_pct = 100;
+            }
+
+            lv_bar_set_value(s_bar_sd, used_pct, LV_ANIM_OFF);
+
+            // Pretty text: show mount + id + space
+            char line[128];
+
+            // MB is nice on-device; GB if you want
+            uint64_t total_mb = total_kb / 1024;
+            uint64_t free_mb  = free_kb / 1024;
+
+            snprintf(line, sizeof(line),
+                    "%s (%s)\n%llu MB free / %llu MB",
+                    watch_sdcard_mount_point(),
+                    watch_sdcard_id_cached(),
+                    (unsigned long long)free_mb,
+                    (unsigned long long)total_mb);
+
+            lv_label_set_text(s_lbl_sd_txt, line);
+        }
+    }
+
+
 
     /* Internal heap */
     size_t int_total  = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
@@ -375,6 +428,8 @@ lv_obj_t *ui_build_device_info_screen(void)
     make_row(s_rows_cont, "Chip", &s_lbl_chip);
     make_row(s_rows_cont, "Chip ID (MAC)", &s_lbl_id);
     make_row(s_rows_cont, "Uptime", &s_lbl_uptime);
+    make_bar_row(s_rows_cont, "SD Card", &s_bar_sd, &s_lbl_sd_txt);
+
     make_row(s_rows_cont, "Flash", &s_lbl_flash);
 
     make_bar_row(s_rows_cont, "Internal Heap", &s_bar_heap, &s_lbl_heap_txt);

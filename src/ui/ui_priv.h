@@ -108,3 +108,11 @@ lv_obj_t *ui_build_low_pwr_screen(void);
 lv_obj_t *ui_build_device_info_screen(void);
 // UI policy hooks (safe to call from non-UI modules via lv_async_call)
 void ui_settings_set_always_on_tile_enabled(bool enabled, bool force_off);
+lv_obj_t *ui_build_sms_overlay_screen(void);
+lv_obj_t *ui_build_sms_threads_screen(void);
+lv_obj_t *ui_build_sms_thread_view_screen(void);
+
+// thread selection bridge
+void ui_sms_set_active_thread(const char *thread_id, const char *name);
+const char *ui_sms_get_active_thread_id(void);
+const char *ui_sms_get_active_thread_name(void);

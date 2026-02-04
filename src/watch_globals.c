@@ -4,7 +4,7 @@
 /* ---------------- TAG ---------------- */
 const char *TAG = "GLOBALS";
 
-const char *FW_VERSION = "0.9.3";
+const char *FW_VERSION = "0.9.4";
 
 /* ---------------- UI globals ---------------- */
 lv_obj_t *clock_date_lbl = NULL;
@@ -98,6 +98,10 @@ lv_obj_t *scr_blank    = NULL;
 lv_obj_t *scr_log      = NULL;
 lv_obj_t *scr_power    = NULL;
 lv_obj_t *scr_low_pwr  = NULL;   // <-- add
+lv_obj_t *scr_sms_overlay = NULL;
+lv_obj_t *scr_sms_threads = NULL;
+lv_obj_t *scr_sms_thread  = NULL;
+
 lv_obj_t *ui_device_info = NULL;
 
 uint16_t g_notif_counts[NG_MAX] = {0};
