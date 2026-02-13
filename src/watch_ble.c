@@ -215,7 +215,7 @@ static int ble_store_status_cb(struct ble_store_status_event *event, void *arg)
 }
 
 /* ---------------- Group mapping ---------------- */
-static notif_type_t notif_group_from_pkg_and_type(const char *type, const char *pkg)
+notif_type_t notif_group_from_pkg_and_type(const char *type, const char *pkg)
 {
     if (pkg && *pkg) {
         if (strstr(pkg, "com.google.android.youtube")) return NG_YOUTUBE;

@@ -636,6 +636,9 @@ void weather_request_update(void)
 {
     if (!s_ev) return;
 
+    ESP_LOGI("MEM", "Free heap size: %d bytes", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI("MEM", "Largest free block: %d bytes", heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
     // Dedup: only set the bit if it isn't already set.
     EventBits_t bits = xEventGroupGetBits(s_ev);
     if (bits & EV_REQ_UPDATE) {

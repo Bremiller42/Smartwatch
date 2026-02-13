@@ -82,6 +82,7 @@ const char *watch_sdcard_id_cached(void);
 
 uint64_t watch_sdcard_total_kb_cached(void);
 uint64_t watch_sdcard_free_kb_cached(void);
+esp_err_t watch_sdcard_request_unmount(uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

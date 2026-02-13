@@ -23,6 +23,37 @@ static void strlcpy0(char *dst, const char *src, size_t dstsz)
     dst[n] = 0;
 }
 
+// Keep only printable ASCII. Drop all UTF-8 multibyte + control chars.
+// Also ensures no '|' remains (since your log is pipe-delimited).
+static void sms_sanitize_ascii(char *dst, size_t dstsz, const char *src)
+{
+    if (!dst || dstsz == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    size_t w = 0;
+    for (size_t i = 0; src[i] && w < dstsz - 1; i++) {
+        unsigned char c = (unsigned char)src[i];
+
+        // normalize whitespace
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+
+        // keep printable ASCII only
+        if (c >= 0x20 && c <= 0x7E) {
+            if (c == '|') c = ' ';     // never allow delimiter in fields
+            dst[w++] = (char)c;
+        } else {
+            // Drop non-ASCII byte (this will strip emoji/curly quotes/etc.)
+            // If you prefer visible replacement, use: dst[w++] = '?';
+        }
+    }
+
+    // trim trailing spaces
+    while (w > 0 && dst[w - 1] == ' ') w--;
+    dst[w] = '\0';
+}
+
+
 static void ensure_dir(const char *path)
 {
     // best-effort
@@ -106,30 +137,42 @@ esp_err_t watch_sms_store_ingest(uint32_t msg_id,
                                 const char *body,
                                 const char *pkg)
 {
+    // Sanitize all incoming decoded strings (ASCII-only)
+    static char thread_s[192];
+    static char sender_s[128];
+    static char body_s[1024];
+    static char pkg_s[128];
+
+    sms_sanitize_ascii(thread_s, sizeof(thread_s), thread_id);
+    sms_sanitize_ascii(sender_s, sizeof(sender_s), sender);
+    sms_sanitize_ascii(pkg_s,    sizeof(pkg_s),    pkg);
+    sms_sanitize_ascii(body_s,   sizeof(body_s),   body);
+
     // Update RAM latest (preview)
     s_latest.msg_id = msg_id;
     s_latest.ts_ms  = ts_ms;
-    strlcpy0(s_latest.thread_id, thread_id, sizeof(s_latest.thread_id));
-    strlcpy0(s_latest.sender,    sender,    sizeof(s_latest.sender));
-    strlcpy0(s_latest.pkg,       pkg,       sizeof(s_latest.pkg));
+    strlcpy0(s_latest.thread_id, thread_s, sizeof(s_latest.thread_id));
+    strlcpy0(s_latest.sender,    sender_s, sizeof(s_latest.sender));
+    strlcpy0(s_latest.pkg,       pkg_s,    sizeof(s_latest.pkg));
 
     // Keep body preview bounded
     char preview[512];
-    strlcpy0(preview, body, sizeof(preview));
+    strlcpy0(preview, body_s, sizeof(preview));
     s_latest_valid = true;
     strlcpy0(s_latest.body, preview, sizeof(s_latest.body));
 
-    // Write to SD in one mount
+    // Write to SD in one mount (use sanitized pointers!)
     sms_write_ctx_t ctx = {
         .msg_id = msg_id,
         .ts_ms = ts_ms,
-        .thread_id = thread_id,
-        .sender = sender,
-        .body = body,
-        .pkg = pkg
+        .thread_id = thread_s,
+        .sender = sender_s,
+        .body = body_s,
+        .pkg = pkg_s
     };
     return watch_sdcard_do(sms_write_work, &ctx, 5000);
 }
+
 
 bool watch_sms_get_latest(watch_sms_latest_t *out)
 {

@@ -188,6 +188,7 @@ typedef struct {
     bool use24_dirty;
     bool wifi_creds_dirty;
     bool hr_dirty;
+    bool volume_dirty;
 } settings_dirty_t;
 
 extern volatile settings_dirty_t g_settings_dirty;

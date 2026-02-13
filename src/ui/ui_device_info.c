@@ -12,17 +12,17 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
+
 #include "watch_globals.h"
 #include "watch_screen_timeout.h"
-#include "ui_priv.h"
+#include "watch_sdcard.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
-#include "watch_sdcard.h"
-#include "esp_log.h"
-#include "ff.h"
-
-
 
 /* Battery / drain globals */
 extern int   g_watch_batt_pct;
@@ -41,7 +41,6 @@ static lv_obj_t   *s_lbl_id     = NULL;
 static lv_obj_t   *s_lbl_uptime = NULL;
 static lv_obj_t   *s_lbl_flash  = NULL;
 static lv_obj_t   *s_lbl_fw     = NULL;
-static lv_obj_t   *s_lbl_sdcard = NULL;
 
 static lv_obj_t   *s_lbl_heap_txt   = NULL;
 static lv_obj_t   *s_lbl_psram_txt  = NULL;
@@ -53,14 +52,24 @@ static lv_obj_t   *s_lbl_drain  = NULL;
 
 static lv_timer_t *s_timer = NULL;
 
-static lv_obj_t *s_bar_sd       = NULL;
-static lv_obj_t *s_lbl_sd_txt   = NULL;
+static lv_obj_t   *s_bar_sd     = NULL;
+static lv_obj_t   *s_lbl_sd_txt = NULL;
+static lv_obj_t   *s_sd_row     = NULL;
 
+/* Modal */
+static lv_obj_t   *s_sd_msgbox  = NULL;
 
-/* Screen-timeout override token (matches log screen pattern) */
+/* ---------------- Screen-timeout override ---------------- */
 static void device_info_enter_always_on(void);
 static void device_info_exit_always_on(void);
+
+/* ---------------- Events ---------------- */
+static void on_back(lv_event_t *e);
 static void on_screen_delete(lv_event_t *e);
+
+/* SD row / modal */
+static void on_sd_row_clicked(lv_event_t *e);
+static void sd_msgbox_btn_cb(lv_event_t *e);
 
 /* ---------------- Helpers ---------------- */
 
@@ -78,7 +87,7 @@ static void fmt_uptime(char *out, size_t out_sz, int64_t ms)
     } else {
         snprintf(out, out_sz, "%" PRId64 "m %" PRId64 "s", min, sec);
     }
-}    
+}
 
 static void device_info_enter_always_on(void)
 {
@@ -91,7 +100,6 @@ static void device_info_exit_always_on(void)
     screen_keep_awake_release();
     screen_timeout_mark_activity();
 }
-
 
 static const char *chip_model_str(esp_chip_model_t m)
 {
@@ -107,7 +115,29 @@ static const char *chip_model_str(esp_chip_model_t m)
     }
 }
 
-/* Compact text row */
+/* Always parent modals to the ACTIVE screen (never NULL). */
+static inline lv_obj_t *ui_parent_screen(void)
+{
+    return lv_scr_act();
+}
+
+/* Close msgbox in a way that also releases indev capture (prevents stuck modal overlay). */
+static void sd_ui_close_msgbox(void)
+{
+    if (!s_sd_msgbox) return;
+
+    lv_indev_t *indev = lv_indev_get_act();
+    if (indev) {
+        lv_indev_reset(indev, s_sd_msgbox);
+    }
+
+    /* Sync delete (we are in LVGL context when this is called) */
+    lv_obj_del(s_sd_msgbox);
+    s_sd_msgbox = NULL;
+}
+
+/* ---------------- UI builders ---------------- */
+
 static lv_obj_t *make_row(lv_obj_t *parent, const char *title, lv_obj_t **out_value_label)
 {
     lv_obj_t *card = lv_obj_create(parent);
@@ -147,7 +177,6 @@ static lv_obj_t *make_row(lv_obj_t *parent, const char *title, lv_obj_t **out_va
     return card;
 }
 
-/* Bar row: title + bar + text */
 static lv_obj_t *make_bar_row(lv_obj_t *parent, const char *title,
                               lv_obj_t **out_bar, lv_obj_t **out_text_label)
 {
@@ -201,6 +230,111 @@ static lv_obj_t *make_bar_row(lv_obj_t *parent, const char *title,
     return card;
 }
 
+/* ---------------- SD unmount async flow ---------------- */
+
+typedef struct {
+    uint32_t timeout_ms;
+} sd_unmount_job_t;
+
+/* Show a simple OK modal (must be called on LVGL thread). */
+static void sd_ui_show_ok(const char *msg)
+{
+    static const char *ok[] = { "OK", "" };
+
+    sd_ui_close_msgbox(); /* just in case */
+
+    s_sd_msgbox = lv_msgbox_create(ui_parent_screen(), "SD Card", msg, ok, true);
+    lv_obj_center(s_sd_msgbox);
+
+    lv_obj_t *btnm = lv_msgbox_get_btns(s_sd_msgbox);
+    lv_obj_add_event_cb(btnm, sd_msgbox_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* Unmount done callback (LVGL thread via lv_async_call). */
+static void sd_unmount_done_cb(void *p)
+{
+    esp_err_t err = (esp_err_t)(intptr_t)p;
+
+    /* Close progress box if present */
+    sd_ui_close_msgbox();
+
+    if (err == ESP_OK) sd_ui_show_ok("Unmounted.");
+    else              sd_ui_show_ok("Unmount failed.");
+}
+
+static void sd_unmount_task(void *arg)
+{
+    sd_unmount_job_t *job = (sd_unmount_job_t *)arg;
+    esp_err_t err = watch_sdcard_request_unmount(job ? job->timeout_ms : 5000);
+
+    /* Post result back to LVGL thread */
+    lv_async_call(sd_unmount_done_cb, (void *)(intptr_t)err);
+
+    if (job) free(job);
+    vTaskDelete(NULL);
+}
+
+static void on_sd_row_clicked(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (s_sd_msgbox) return;
+
+    if (!watch_sdcard_is_mounted()) {
+        static const char *btns[] = { "OK", "" };
+        s_sd_msgbox = lv_msgbox_create(ui_parent_screen(), "SD Card", "SD card is not mounted.", btns, true);
+        lv_obj_center(s_sd_msgbox);
+
+        lv_obj_t *btnm = lv_msgbox_get_btns(s_sd_msgbox);
+        lv_obj_add_event_cb(btnm, sd_msgbox_btn_cb, LV_EVENT_CLICKED, NULL);
+        return;
+    }
+
+    static const char *btns[] = { "Unmount", "Cancel", "" };
+    s_sd_msgbox = lv_msgbox_create(
+        ui_parent_screen(),
+        "Unmount SD Card",
+        "Safely unmount the SD card?\nAny active writes will stop.",
+        btns,
+        true
+    );
+    lv_obj_center(s_sd_msgbox);
+
+    lv_obj_t *btnm = lv_msgbox_get_btns(s_sd_msgbox);
+    lv_obj_add_event_cb(btnm, sd_msgbox_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void sd_msgbox_btn_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!s_sd_msgbox) return;
+
+    const char *txt = lv_msgbox_get_active_btn_text(s_sd_msgbox);
+    if (!txt) txt = "";
+
+    /* Copy selection before we delete the box */
+    char choice[16];
+    strncpy(choice, txt, sizeof(choice) - 1);
+    choice[sizeof(choice) - 1] = '\0';
+
+    /* Close current modal fully (including bg) */
+    sd_ui_close_msgbox();
+
+    if (strcmp(choice, "Unmount") == 0) {
+        /* Show a non-modal progress box (no input blocking) */
+        static const char *none[] = { "", "" };
+        s_sd_msgbox = lv_msgbox_create(ui_parent_screen(), "SD Card", "Unmounting...", none, false);
+        lv_obj_center(s_sd_msgbox);
+
+        sd_unmount_job_t *job = (sd_unmount_job_t *)malloc(sizeof(sd_unmount_job_t));
+        if (job) job->timeout_ms = 5000;
+
+        xTaskCreate(sd_unmount_task, "sd_unmount_ui", 3072, job, 5, NULL);
+        return;
+    }
+
+    /* OK/Cancel: nothing else to do */
+}
+
 /* ---------------- Events ---------------- */
 
 static void on_back(lv_event_t *e)
@@ -211,12 +345,12 @@ static void on_back(lv_event_t *e)
     ui_show(UI_HOME);
 }
 
-
 static void on_screen_delete(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_DELETE) return;
 
     device_info_exit_always_on();
+    sd_ui_close_msgbox();
 
     s_title = NULL;
     s_rows_cont = NULL;
@@ -225,22 +359,22 @@ static void on_screen_delete(lv_event_t *e)
     s_lbl_id = NULL;
     s_lbl_uptime = NULL;
     s_lbl_flash = NULL;
+    s_lbl_fw = NULL;
 
     s_lbl_heap_txt = NULL;
     s_lbl_psram_txt = NULL;
     s_bar_heap = NULL;
     s_bar_psram = NULL;
+
     s_bar_sd = NULL;
     s_lbl_sd_txt = NULL;
+    s_sd_row = NULL;
 
     s_lbl_batt = NULL;
     s_lbl_drain = NULL;
-    s_lbl_fw = NULL;
-    // s_lbl_sdcard = NULL;
 
     if (s_timer) lv_timer_pause(s_timer);
 }
-
 
 /* ---------------- Refresh ---------------- */
 
@@ -282,7 +416,7 @@ static void refresh_cb(lv_timer_t *t)
     else                 snprintf(buf, sizeof(buf), "unknown");
     lv_label_set_text(s_lbl_flash, buf);
 
-    // SD Card bar + text (cached; UI thread safe)
+    /* SD Card bar + text (cached; UI thread safe) */
     if (s_bar_sd && s_lbl_sd_txt) {
         if (!watch_sdcard_is_mounted()) {
             lv_bar_set_value(s_bar_sd, 0, LV_ANIM_OFF);
@@ -301,25 +435,20 @@ static void refresh_cb(lv_timer_t *t)
 
             lv_bar_set_value(s_bar_sd, used_pct, LV_ANIM_OFF);
 
-            // Pretty text: show mount + id + space
             char line[128];
-
-            // MB is nice on-device; GB if you want
             uint64_t total_mb = total_kb / 1024;
             uint64_t free_mb  = free_kb / 1024;
 
             snprintf(line, sizeof(line),
-                    "%s (%s)\n%llu MB free / %llu MB",
-                    watch_sdcard_mount_point(),
-                    watch_sdcard_id_cached(),
-                    (unsigned long long)free_mb,
-                    (unsigned long long)total_mb);
+                     "%s (%s)\n%llu MB free / %llu MB",
+                     watch_sdcard_mount_point(),
+                     watch_sdcard_id_cached(),
+                     (unsigned long long)free_mb,
+                     (unsigned long long)total_mb);
 
             lv_label_set_text(s_lbl_sd_txt, line);
         }
     }
-
-
 
     /* Internal heap */
     size_t int_total  = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
@@ -361,6 +490,7 @@ static void refresh_cb(lv_timer_t *t)
         }
     }
 
+    /* Battery */
     if (g_watch_batt_pct < 0 || g_watch_batt_v < 0.0f) {
         lv_label_set_text(s_lbl_batt, "--");
     } else {
@@ -368,6 +498,7 @@ static void refresh_cb(lv_timer_t *t)
         lv_label_set_text(s_lbl_batt, buf);
     }
 
+    /* Drain / ETA */
     if (g_batt_eta_min > 0) {
         int hr = g_batt_eta_min / 60;
         int mn = g_batt_eta_min % 60;
@@ -423,12 +554,15 @@ lv_obj_t *ui_build_device_info_screen(void)
 
     lv_obj_set_flex_flow(s_rows_cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_rows_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    
+
     make_row(s_rows_cont, "Firmware", &s_lbl_fw);
     make_row(s_rows_cont, "Chip", &s_lbl_chip);
     make_row(s_rows_cont, "Chip ID (MAC)", &s_lbl_id);
     make_row(s_rows_cont, "Uptime", &s_lbl_uptime);
-    make_bar_row(s_rows_cont, "SD Card", &s_bar_sd, &s_lbl_sd_txt);
+
+    s_sd_row = make_bar_row(s_rows_cont, "SD Card", &s_bar_sd, &s_lbl_sd_txt);
+    lv_obj_add_flag(s_sd_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_sd_row, on_sd_row_clicked, LV_EVENT_CLICKED, NULL);
 
     make_row(s_rows_cont, "Flash", &s_lbl_flash);
 
@@ -445,9 +579,6 @@ lv_obj_t *ui_build_device_info_screen(void)
 
     refresh_cb(NULL);
 
-    /* EXACTLY like log screen: push override at end of build */
     device_info_enter_always_on();
-
-
     return scr;
 }

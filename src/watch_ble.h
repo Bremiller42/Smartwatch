@@ -1,7 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include "esp_err.h"
-
+#include "watch_globals.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,6 +26,8 @@ void ble_request_awake_params(void);
 /* NEW: explicit enable/disable API (user intent) */
 void ble_set_enabled(bool on);
 bool ble_is_enabled(void);
+
+notif_type_t notif_group_from_pkg_and_type(const char *type, const char *pkg);
 
 #ifdef __cplusplus
 }

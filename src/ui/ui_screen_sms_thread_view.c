@@ -64,15 +64,40 @@ static void ingest_line_for_thread(char *line, const char *thread_id)
 {
     // msg_id|ts_ms|thread_id|sender|pkg|body
     char *save = NULL;
-    (void)strtok_r(line, "|", &save);
-    char *ts   = strtok_r(NULL, "|", &save);
-    char *tid  = strtok_r(NULL, "|", &save);
-    char *snd  = strtok_r(NULL, "|", &save);
-    (void)strtok_r(NULL, "|", &save);
-    char *body = strtok_r(NULL, "|", &save);
+    (void)strtok_r(line, "|", &save);        // msg_id
+    char *ts   = strtok_r(NULL, "|", &save); // ts_ms
+    char *tid  = strtok_r(NULL, "|", &save); // thread_id
+    char *snd  = strtok_r(NULL, "|", &save); // sender
+    (void)strtok_r(NULL, "|", &save);        // pkg
+    char *body = strtok_r(NULL, "|", &save); // body
 
     if (!ts || !tid || !snd || !body) return;
     if (strcmp(tid, thread_id) != 0) return;
+
+    if (s_msg_count >= MAX_MSGS) {
+        memmove(&s_msgs[0], &s_msgs[1], sizeof(sms_msg_t) * (MAX_MSGS - 1));
+        s_msg_count = MAX_MSGS - 1;
+    }
+
+    sms_msg_t *m = &s_msgs[s_msg_count++];
+    m->ts_ms = strtoull(ts, NULL, 10);
+    strlcpy0(m->sender, sizeof(m->sender), snd);
+    body_sanitize(m->body, sizeof(m->body), body);
+}
+
+static void ingest_line_for_sender(char *line, const char *sender)
+{
+    // msg_id|ts_ms|thread_id|sender|pkg|body
+    char *save = NULL;
+    (void)strtok_r(line, "|", &save);
+    char *ts   = strtok_r(NULL, "|", &save);
+    (void)strtok_r(NULL, "|", &save); // tid
+    char *snd  = strtok_r(NULL, "|", &save);
+    (void)strtok_r(NULL, "|", &save); // pkg
+    char *body = strtok_r(NULL, "|", &save);
+
+    if (!ts || !snd || !body) return;
+    if (strcmp(snd, sender) != 0) return;
 
     // keep last MAX_MSGS messages by shifting when full
     if (s_msg_count >= MAX_MSGS) {
@@ -86,14 +111,45 @@ static void ingest_line_for_thread(char *line, const char *thread_id)
     body_sanitize(m->body, sizeof(m->body), body);
 }
 
-typedef struct { uint8_t *buf; size_t len; } load_ctx_t;
-static esp_err_t load_log_work(void *p)
+static void load_thread_msgs(const char *thread_id, const char *sender_fallback)
 {
-    load_ctx_t *c = (load_ctx_t*)p;
-    return watch_sdcard_read_file(SMS_LOG_PATH, &c->buf, &c->len, MAX_LOG_BYTES, 0);
+    msgs_clear();
+
+    uint8_t *buf = NULL;
+    size_t len = 0;
+
+    esp_err_t e = watch_sdcard_read_file(SMS_LOG_PATH, &buf, &len, MAX_LOG_BYTES, 5000);
+    if (e != ESP_OK || !buf || len == 0) {
+        if (buf) free(buf);
+        return;
+    }
+
+    char *s = (char*)buf;
+    char *line = s;
+
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '\n') {
+            s[i] = 0;
+            if (line[0]) {
+                size_t L = strlen(line);
+                if (L && line[L - 1] == '\r') line[L - 1] = 0;
+
+                if (thread_id && *thread_id) ingest_line_for_thread(line, thread_id);
+                else if (sender_fallback && *sender_fallback) ingest_line_for_sender(line, sender_fallback);
+            }
+            line = &s[i + 1];
+        }
+    }
+
+    if (line && *line) {
+        if (thread_id && *thread_id) ingest_line_for_thread(line, thread_id);
+        else if (sender_fallback && *sender_fallback) ingest_line_for_sender(line, sender_fallback);
+    }
+
+    free(buf);
 }
 
-static void load_thread_msgs(const char *thread_id)
+static void load_sender_msgs(const char *sender)
 {
     msgs_clear();
 
@@ -115,15 +171,16 @@ static void load_thread_msgs(const char *thread_id)
             if (line[0]) {
                 size_t L = strlen(line);
                 if (L && line[L - 1] == '\r') line[L - 1] = 0;
-                ingest_line_for_thread(line, thread_id);
+                ingest_line_for_sender(line, sender);
             }
             line = &s[i + 1];
         }
     }
-    if (line && *line) ingest_line_for_thread(line, thread_id);
+    if (line && *line) ingest_line_for_sender(line, sender);
 
     free(buf);
 }
+
 
 
 static void on_back(lv_event_t *e)
@@ -148,12 +205,12 @@ static void render_msgs(void)
 
         lv_obj_t *bubble = lv_obj_create(s_col);
         lv_obj_set_width(bubble, lv_pct(100));
-        lv_obj_set_style_bg_color(bubble, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_bg_color(bubble, UI_COLOR(BLACK), 0);
         lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(bubble, 14, 0);
         lv_obj_set_style_pad_all(bubble, 10, 0);
         lv_obj_set_style_border_width(bubble, 1, 0);
-        lv_obj_set_style_border_color(bubble, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_border_color(bubble, UI_COLOR(THEME), 0);
         lv_obj_clear_flag(bubble, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *hdr = lv_label_create(bubble);
@@ -163,10 +220,10 @@ static void render_msgs(void)
 
         lv_obj_t *body = lv_label_create(bubble);
         lv_label_set_text(body, m->body);
-        lv_obj_set_style_text_color(body, lv_color_hex(0xDDDDDD), 0);
+        lv_obj_set_style_text_color(body, UI_COLOR(THEME), 0);
         lv_obj_set_style_text_font(body, &lv_font_montserrat_16, 0);
         lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(body, lv_pct(100));
+        lv_obj_set_width(body, lv_pct(70));
         lv_obj_align_to(body, hdr, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
 
         lv_obj_t *sp = lv_obj_create(s_col);
@@ -180,6 +237,10 @@ lv_obj_t *ui_build_sms_thread_view_screen(void)
 {
     const char *tid = ui_sms_get_active_thread_id();
     const char *name = ui_sms_get_active_thread_name();
+    const char *sender = ui_sms_get_active_sender();
+    load_thread_msgs(tid, sender);
+
+    // if (sender && *sender) load_sender_msgs(sender);
 
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -222,11 +283,11 @@ lv_obj_t *ui_build_sms_thread_view_screen(void)
     lv_obj_set_flex_align(s_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_clear_flag(s_col, LV_OBJ_FLAG_SCROLLABLE);
 
-    if (tid && *tid) load_thread_msgs(tid);
     render_msgs();
 
     // scroll to bottom
-    lv_obj_scroll_to_y(sc, lv_obj_get_height(s_col), LV_ANIM_OFF);
+    lv_obj_update_layout(sc);
+    lv_obj_scroll_to_y(sc, lv_obj_get_scroll_bottom(sc), LV_ANIM_OFF);
 
     return scr;
 }

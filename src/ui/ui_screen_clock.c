@@ -473,6 +473,7 @@ lv_obj_t *ui_build_clock_screen(void)
     // Show whatever we currently have (cached)
     lv_async_call(wx_refresh_async, NULL);
 
+
     // Also request a fresh update now that the clock screen exists
     // (it will be throttled by your min_refresh anyway)
     weather_request_update();

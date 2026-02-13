@@ -4,7 +4,7 @@
 /* ---------------- TAG ---------------- */
 const char *TAG = "GLOBALS";
 
-const char *FW_VERSION = "0.9.4";
+const char *FW_VERSION = "0.9.5";
 
 /* ---------------- UI globals ---------------- */
 lv_obj_t *clock_date_lbl = NULL;

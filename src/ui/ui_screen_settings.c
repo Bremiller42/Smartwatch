@@ -74,9 +74,6 @@ static void weather_update_subtitle_async(void *arg)
     weather_update_subtitle();
 }
 
-
-
-
 static void on_weather_tile_clicked(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -262,6 +259,12 @@ static void on_open_brightness(lv_event_t *e)
     open_brightness_modal(lv_scr_act());
 }
 
+static void on_open_volume(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_volume_modal(lv_scr_act());
+}
+
 static void on_open_wifi_picker(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -371,6 +374,7 @@ lv_obj_t *ui_build_settings_screen(void)
     lv_obj_set_style_radius(tab_bar, 10, LV_PART_ITEMS);
 
     lv_obj_t *tab_display = lv_tabview_add_tab(tv, "Display");
+    lv_obj_t *tab_audio   = lv_tabview_add_tab(tv, "Audio");
     lv_obj_t *tab_network = lv_tabview_add_tab(tv, "Network");
     lv_obj_t *tab_time    = lv_tabview_add_tab(tv, "Time/Date");
     lv_obj_t *tab_about   = lv_tabview_add_tab(tv, "About");
@@ -408,6 +412,25 @@ lv_obj_t *ui_build_settings_screen(void)
     always_on_update_subtitle();
     lv_obj_add_event_cb(t_always_on, on_always_on_tile_clicked, LV_EVENT_CLICKED, NULL);
     tile_set_on(t_always_on, screen_timeout_get_always_on());
+
+    // AUDIO GRID
+        // DISPLAY GRID
+    lv_obj_t *g_audio = lv_obj_create(tab_audio);
+    lv_obj_set_size(g_audio, lv_pct(100), lv_pct(100));
+    lv_obj_center(g_audio);
+    lv_obj_set_style_bg_opa(g_audio, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(g_audio, 0, 0);
+    lv_obj_set_style_pad_all(g_audio, 14, 0);
+    lv_obj_set_style_pad_row(g_audio, 14, 0);
+    lv_obj_set_style_pad_column(g_audio, 14, 0);
+    lv_obj_clear_flag(g_audio, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_grid_dsc_array(g_audio, col_dsc, row_dsc);
+
+    lv_obj_t *t_volume = tile_create_nav_tile(g_audio, "Volume", "Adjust", on_open_volume);
+    lv_obj_set_grid_cell(t_volume, LV_GRID_ALIGN_CENTER, 0, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+
+    
+
 
     // NETWORK GRID
     lv_obj_t *g_net = lv_obj_create(tab_network);

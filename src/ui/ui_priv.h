@@ -89,6 +89,7 @@ void apply_backlight_percent(int pct);
 void clock_timer_cb(lv_timer_t *t);
 void ui_notif_bar_attach(lv_obj_t *clock_screen_parent);
 void open_brightness_modal(lv_obj_t *parent);
+void open_volume_modal(lv_obj_t *parent);
 void open_settime_modal(lv_obj_t *parent);
 void ui_update_wifi_icon_async(void *arg);
 void ui_update_ble_status_async(void *arg);
@@ -116,3 +117,6 @@ lv_obj_t *ui_build_sms_thread_view_screen(void);
 void ui_sms_set_active_thread(const char *thread_id, const char *name);
 const char *ui_sms_get_active_thread_id(void);
 const char *ui_sms_get_active_thread_name(void);
+// SMS nav helpers
+void ui_sms_set_active_sender(const char *sender);
+const char *ui_sms_get_active_sender(void);

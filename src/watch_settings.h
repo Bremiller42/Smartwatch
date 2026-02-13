@@ -18,3 +18,8 @@ void settings_save_hr_current(float bpm, bool valid);
 void settings_load_hr_current_into_ui(void);
 void settings_commit_dirty_now(void);
 void settings_save_screen_always_on(bool on);
+int  settings_get_volume_pct(int fallback);
+bool settings_get_volume_muted(bool fallback);
+
+void settings_save_volume_pct(int pct);
+void settings_save_volume_muted(bool muted);

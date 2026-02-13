@@ -9,6 +9,7 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "ff.h"   
+#include "ui_priv.h"
 
 #include "watch_screen_timeout.h"
 
@@ -39,6 +40,24 @@ static bool          s_bus_inited = false;
 static bool          s_bus_owned  = false;
 
 static SemaphoreHandle_t s_sd_mutex = NULL;
+
+
+typedef enum {
+    SD_JOB_WORK = 0,
+    SD_JOB_UNMOUNT,
+} sd_job_type_t;
+
+typedef struct {
+    sd_job_type_t      type;        // NEW
+    watch_sd_work_fn_t fn;
+    void              *ctx;
+    uint32_t           timeout_ms;
+
+    // completion
+    SemaphoreHandle_t  done_sem;
+    esp_err_t          result;
+} sd_job_t;
+
 
 /* ---------------- Cached SD “Label” ----------------
  * NOTE: This is NOT the FAT volume label (since your build lacks f_getlabel()).
@@ -133,15 +152,6 @@ static void sd_id_update_after_mount(void)
 #define SD_TASK_PRIO   5
 #define SDQ_DEPTH      4
 
-typedef struct {
-    watch_sd_work_fn_t fn;
-    void              *ctx;
-    uint32_t           timeout_ms;
-
-    // completion
-    SemaphoreHandle_t  done_sem;
-    esp_err_t          result;
-} sd_job_t;
 
 static QueueHandle_t s_sdq = NULL;
 static TaskHandle_t  s_sd_task = NULL;
@@ -184,6 +194,36 @@ static void give_lock(void)
 bool watch_sdcard_is_mounted(void)
 {
     return s_mounted;
+}
+
+esp_err_t watch_sdcard_request_unmount(uint32_t timeout_ms)
+{
+    if (!s_sdq) return ESP_ERR_INVALID_STATE; // init not called
+
+    sd_job_t job = {0};
+    job.type = SD_JOB_UNMOUNT;
+    job.timeout_ms = timeout_ms;
+    job.result = ESP_FAIL;
+    job.done_sem = xSemaphoreCreateBinary();
+    if (!job.done_sem) return ESP_ERR_NO_MEM;
+
+    sd_job_t *pjob = &job;
+
+    TickType_t ticks = (timeout_ms == 0) ? 0 : pdMS_TO_TICKS(timeout_ms);
+
+    if (xQueueSend(s_sdq, &pjob, ticks) != pdTRUE) {
+        vSemaphoreDelete(job.done_sem);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (xSemaphoreTake(job.done_sem, ticks ? ticks : portMAX_DELAY) != pdTRUE) {
+        vSemaphoreDelete(job.done_sem);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    vSemaphoreDelete(job.done_sem);
+    // ui_show(UI_DEVICE_INFO); // refresh UI state after unmount
+    return job.result;
 }
 
 const char *watch_sdcard_mount_point(void)
@@ -316,6 +356,20 @@ static void sd_task(void *arg)
             continue;
         }
 
+        if (job->type == SD_JOB_UNMOUNT) {
+            // Safely unmount if mounted (serialized by mutex)
+            if (s_mounted) {
+                watch_sdcard_unmount();
+            }
+            give_lock();
+            job->result = ESP_OK;
+
+            screen_keep_awake_release();
+            xSemaphoreGive(job->done_sem);
+            continue;
+        }
+
+        // SD_JOB_WORK (default): mount then run work
         esp_err_t m = watch_sdcard_mount();
         if (m != ESP_OK) {
             give_lock();
@@ -325,7 +379,6 @@ static void sd_task(void *arg)
             continue;
         }
 
-        // run job while SD is mounted + serialized
         esp_err_t w = job->fn ? job->fn(job->ctx) : ESP_ERR_INVALID_ARG;
 
         give_lock();
@@ -335,6 +388,7 @@ static void sd_task(void *arg)
         xSemaphoreGive(job->done_sem);
     }
 }
+
 
 /* ---------------- Public: init + do ---------------- */
 
@@ -359,6 +413,7 @@ esp_err_t watch_sdcard_do(watch_sd_work_fn_t work, void *ctx, uint32_t timeout_m
     if (!s_sdq)  return ESP_ERR_INVALID_STATE; // init not called
 
     sd_job_t job = {0};
+    job.type = SD_JOB_WORK; 
     job.fn = work;
     job.ctx = ctx;
     job.timeout_ms = timeout_ms;

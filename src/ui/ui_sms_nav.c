@@ -4,6 +4,7 @@
 
 static char s_active_thread_id[192];
 static char s_active_thread_name[96];
+static char s_active_sender[96];
 
 void ui_sms_set_active_thread(const char *thread_id, const char *name)
 {
@@ -16,5 +17,13 @@ void ui_sms_set_active_thread(const char *thread_id, const char *name)
     s_active_thread_name[sizeof(s_active_thread_name)-1] = 0;
 }
 
+void ui_sms_set_active_sender(const char *sender)
+{
+    if (!sender) sender = "";
+    strncpy(s_active_sender, sender, sizeof(s_active_sender)-1);
+    s_active_sender[sizeof(s_active_sender)-1] = 0;
+}
+
+const char *ui_sms_get_active_sender(void) { return s_active_sender; }
 const char *ui_sms_get_active_thread_id(void)   { return s_active_thread_id; }
 const char *ui_sms_get_active_thread_name(void) { return s_active_thread_name; }

@@ -4,7 +4,7 @@
 #include "watch_heartrate.h"       // hr_set_boot_bpm_current()
 #include "watch_shutdown.h"
 #include "watch_screen_timeout.h"
-
+#include "watch_volume.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +26,13 @@
 #define KEY_SCREEN_ALWAYS_ON "scr_always"
 #endif
 
+#ifndef KEY_VOLUME_PCT
+#define KEY_VOLUME_PCT   "vol_pct"
+#endif
+
+#ifndef KEY_VOLUME_MUTED
+#define KEY_VOLUME_MUTED "vol_mute"
+#endif
 static const char *SET_TAG = "SETTINGS";
 
 // NEW: gate commits when battery is critical+
@@ -103,7 +110,83 @@ void settings_save_wifi_creds(const char *ssid, const char *pass)
     snprintf(g_wifi_ssid, sizeof(g_wifi_ssid), "%s", ssid);
     snprintf(g_wifi_pass, sizeof(g_wifi_pass), "%s", pass);
 }
+int settings_get_volume_pct(int fallback)
+{
+    if (!g_nvs_ok) return fallback;
 
+    int32_t v = fallback;
+    esp_err_t e = nvs_get_i32(g_nvs, KEY_VOLUME_PCT, &v);
+    if (e != ESP_OK) return fallback;
+
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    return (int)v;
+}
+
+bool settings_get_volume_muted(bool fallback)
+{
+    if (!g_nvs_ok) return fallback;
+
+    uint8_t m = fallback ? 1 : 0;
+    esp_err_t e = nvs_get_u8(g_nvs, KEY_VOLUME_MUTED, &m);
+    if (e != ESP_OK) return fallback;
+
+    return (m != 0);
+}
+
+void settings_save_volume_pct(int pct)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(SET_TAG, "Save volume skipped (NVS not ready)");
+        return;
+    }
+
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    esp_err_t err = nvs_set_i32(g_nvs, KEY_VOLUME_PCT, (int32_t)pct);
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "Save volume set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // If you have no dedicated flag, re-use something sane.
+    // Best: add volume_dirty to settings_dirty_t later.
+    g_settings_dirty.brightness_dirty = true;
+
+    if (nvs_safe_to_commit()) {
+        err = nvs_commit(g_nvs);
+        ESP_LOGI(SET_TAG, "Saved volume=%d (%s)", pct, esp_err_to_name(err));
+        if (err == ESP_OK) g_settings_dirty.brightness_dirty = false;
+    } else {
+        ESP_LOGW(SET_TAG, "volume commit deferred (battery critical)");
+    }
+}
+
+void settings_save_volume_muted(bool muted)
+{
+    if (!g_nvs_ok) {
+        ESP_LOGW(SET_TAG, "Save volume mute skipped (NVS not ready)");
+        return;
+    }
+
+    esp_err_t err = nvs_set_u8(g_nvs, KEY_VOLUME_MUTED, muted ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(SET_TAG, "Save volume mute set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // Same note: ideally add volume_dirty; for now reuse a dirty bit.
+    g_settings_dirty.brightness_dirty = true;
+
+    if (nvs_safe_to_commit()) {
+        err = nvs_commit(g_nvs);
+        ESP_LOGI(SET_TAG, "Saved volume_muted=%d (%s)", (int)muted, esp_err_to_name(err));
+        if (err == ESP_OK) g_settings_dirty.brightness_dirty = false;
+    } else {
+        ESP_LOGW(SET_TAG, "volume mute commit deferred (battery critical)");
+    }
+}
 // NEW: save always-on flag
 void settings_save_screen_always_on(bool on)
 {
@@ -168,6 +251,7 @@ void settings_load_from_nvs(void)
     }
 
     settings_load_wifi_creds();
+    volume_init_from_settings();
 
     uint32_t sto = 15;
     esp_err_t err_sto = nvs_get_u32(g_nvs, KEY_SCREEN_TIMEOUT, &sto);
@@ -223,7 +307,9 @@ void settings_commit_dirty_now(void)
         g_settings_dirty.screen_timeout_dirty ||
         g_settings_dirty.use24_dirty ||
         g_settings_dirty.wifi_creds_dirty ||
-        g_settings_dirty.hr_dirty;
+        g_settings_dirty.hr_dirty ||
+        g_settings_dirty.volume_dirty;
+
 
     if (!any) return;
 

@@ -3,6 +3,9 @@
 #include "esp_log.h"
 #include "../watch_icons/watch_icons.h"
 #include "watch_audio.h"
+#include "watch_ble.h"   // for notif_type_t
+#include "lvgl.h"
+
 static const char *UI_NOTI_TAG = "UI_NOTIF";
 
 
@@ -21,7 +24,7 @@ static lv_obj_t *notif_badge_stroke[NG_MAX][4] = {0};
 
 static lv_font_t *font_badge_bold = (lv_font_t *)&lv_font_montserrat_22;
 
-static const lv_img_dsc_t *icon_for_group(notif_type_t g)
+const lv_img_dsc_t *icon_for_group(notif_type_t g)
 {
     switch (g) {
         case NG_YOUTUBE:   return &icon_youtube_brands_solid;
@@ -38,7 +41,7 @@ static const lv_img_dsc_t *icon_for_group(notif_type_t g)
         case NG_SYSTEM:    return &icon_desktop_solid;
 
         case NG_APP:       return &icon_gear_solid;
-        default:           return NULL;
+        default:           return &icon_gear_solid;
     }
 }
 
